@@ -1166,6 +1166,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   // 以前靠 tools/tunnel.ps1 手动跑 cloudflared，它一被父进程带走、或者 DNS 抖一下退出，
   // 手机在 4G 就连不上了。这里改成由宿主进程负责拉起与重启，掉线会自动恢复。
   let tunnelChild = null
+  /** cloudflared 最近的原始输出，进程快速退出时用来解释原因。 */
+  let tunnelTail = []
   let tunnelTimer = null
   let tunnelAttempt = 0
   let tunnelStopped = false
@@ -1304,10 +1306,16 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       return
     }
     tunnelChild = child
+    tunnelTail = []
     log(`隧道启动中 pid=${child.pid}`)
 
     const onData = (chunk) => {
       for (const line of String(chunk).split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        // 留最后几行原始输出：cloudflared 快速退出时，原因只写在 stderr 里。
+        tunnelTail.push(trimmed.slice(0, 200))
+        if (tunnelTail.length > 6) tunnelTail.shift()
         const match = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
         if (match) adoptTunnelUrl(match[0])
       }
@@ -1334,6 +1342,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       tunnelAttempt += 1
       const delay = Math.min(60_000, 5_000 * tunnelAttempt)
       log(`隧道进程退出 code=${code}，${Math.round(delay / 1000)}s 后重启`)
+      if (tunnelTail.length > 0) log(`  cloudflared 最后输出：${tunnelTail.join(' | ')}`)
       scheduleTunnel(delay)
     })
   }
