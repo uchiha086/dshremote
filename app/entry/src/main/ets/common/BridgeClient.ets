@@ -150,6 +150,7 @@ export class BridgePoller {
     // 从此刻开始算，避免把桥里缓存的历史事件全部当新通知重放。
     this.since = Date.now();
     this.stopped = false;
+    this.onStatus('轮询已启动');
     this.tick();
     this.timer = setInterval(() => {
       this.tick();
@@ -194,7 +195,9 @@ export class BridgePoller {
         this.onStatus('token 不对');
       }
     } catch (error) {
-      // 网络抖动下一轮再试，不打扰用户。
+      // 网络抖动下一轮再试，但把原因显示出来便于排查。
+      const err = error as BusinessError;
+      this.onStatus(`轮询失败 ${err.code ?? ''} ${err.message ?? ''}`);
     } finally {
       client.destroy();
       this.busy = false;

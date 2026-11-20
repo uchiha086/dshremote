@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
 import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
 import { BridgeHttp, BridgePoller, TurnEndEvent } from '../common/BridgeClient';
+import { Notifier } from '../common/Notifier';
 
 @Entry
 @Component
@@ -22,6 +23,7 @@ struct Index {
 
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
+    Notifier.enable(context);
     ConfigStore.init(context).then(async () => {
       const loaded = await ConfigStore.load();
       this.cfg = loaded;
@@ -89,6 +91,12 @@ struct Index {
     this.poller.onTurnEnd = (event: TurnEndEvent) => {
       const title = event.sessionTitle.length > 0 ? event.sessionTitle : '会话';
       this.statusText = `回合结束 · ${title}`;
+      const head = event.answerHead.length > 0 ? event.answerHead : event.question;
+      Notifier.publish(`${title} · ${event.status}`, head).then((reason: string) => {
+        if (reason.length > 0) {
+          this.statusText = `回合结束 · 通知失败：${reason}`;
+        }
+      });
     };
     this.poller.start(this.cfg.host, this.cfg.port, this.cfg.token);
     // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
@@ -185,9 +193,7 @@ struct Index {
           .width('100%')
           .layoutWeight(1)
           .onPageEnd(() => {
-            if (this.statusText.length === 0) {
-              this.statusText = 'DSH 已加载';
-            }
+            this.statusText = 'DSH 已加载 · 等待回合结束';
           })
       } else {
         Column({ space: 10 }) {
