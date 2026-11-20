@@ -9,7 +9,7 @@ import { svgOf } from './qr.mjs'
 import { createWebSocketServer } from './websocket.mjs'
 
 /** 桥插件版本，手机端据此判断兼容性。 */
-const BRIDGE_VERSION = '0.1.0'
+const BRIDGE_VERSION = '0.2.0'
 
 /** WebSocket 子协议标识，握手时就固定，避免手机连到别的服务上。 */
 const WS_PROTOCOL = 'dshremote-bridge-v1'
@@ -504,6 +504,19 @@ export function apply(ctx, config) {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
 
+    // 桌面端页面跑在 dsh-app://app 这类自定义协议下，请求桥属于跨源；
+    // 统一的 CORS 预检与响应头放在最前面，省得每个路由各写一遍。
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, POST, OPTIONS',
+        'access-control-allow-headers': 'content-type',
+        'access-control-max-age': '600',
+      })
+      response.end()
+      return
+    }
+
     if (url.pathname === '/health') {
       const body = JSON.stringify({
         ok: true,
@@ -646,7 +659,11 @@ export function apply(ctx, config) {
       }
       try {
         const svg = svgOf(pairing(host).payload, { scale: 8, margin: 4 })
-        response.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-store' })
+        response.writeHead(200, {
+          'content-type': 'image/svg+xml; charset=utf-8',
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+        })
         response.end(svg)
       } catch (error) {
         log(`二维码生成失败：${error?.message ?? error}`)

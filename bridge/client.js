@@ -4,41 +4,64 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
 
-    // 桥可能和页面不同源：页面走 7627（反代端口）时，桥在 3088。
-    // 先按同源试，失败再退回 <host>:3088。
+    // 浮层用 portal 挂到 body，避免被侧栏/布局里带 transform 或 overflow 的祖先裁掉。
+    let createPortal = null
+    try {
+      const ReactDOM = require('react-dom')
+      if (ReactDOM && typeof ReactDOM.createPortal === 'function') createPortal = ReactDOM.createPortal
+    } catch {
+      // 拿不到 react-dom 就退回就地渲染
+    }
+
+    // 桥可能和页面不同源：
+    // - 手机 / 浏览器经反代打开 → 页面是 http://<host>:7627，桥在 <host>:3088
+    // - 桌面端是 dsh-app://app 这类自定义协议 → 页面根本不带 http 端口，只能直接打回环
     const BRIDGE_PORT_FALLBACK = 3088
-    let resolvedBase = null
 
     function candidateBases() {
-      const bases = ['']
-      if (typeof window !== 'undefined' && window.location) {
-        const { protocol, hostname, port } = window.location
-        if (port !== String(BRIDGE_PORT_FALLBACK)) {
-          bases.push(`${protocol}//${hostname}:${BRIDGE_PORT_FALLBACK}`)
+      const bases = []
+      const push = (base) => {
+        if (!bases.includes(base)) bases.push(base)
+      }
+      const location = typeof window !== 'undefined' ? window.location : null
+      const protocol = location?.protocol ?? ''
+      if (protocol === 'http:' || protocol === 'https:') {
+        push('')
+        if (location.port !== String(BRIDGE_PORT_FALLBACK)) {
+          push(`${protocol}//${location.hostname}:${BRIDGE_PORT_FALLBACK}`)
         }
       }
+      push(`http://127.0.0.1:${BRIDGE_PORT_FALLBACK}`)
+      push(`http://localhost:${BRIDGE_PORT_FALLBACK}`)
       return bases
     }
 
-    async function bridgeFetch(path) {
-      if (resolvedBase !== null) return fetch(`${resolvedBase}${path}`)
+    /** 逐个候选地址试；返回 {base, info, svg} 或 {error}，把失败原因原样带回来便于在面板上显示。 */
+    async function loadPairing() {
+      const problems = []
       for (const base of candidateBases()) {
+        const label = base === '' ? '同源' : base
         try {
-          const response = await fetch(`${base}${path}`)
-          if (response.ok && (response.headers.get('content-type') || '').includes('json')) {
-            resolvedBase = base
-            return response
+          const response = await fetch(`${base}/pair`)
+          if (!response.ok) {
+            problems.push(`${label} → HTTP ${response.status}`)
+            continue
           }
-        } catch {
-          // 换下一个候选
+          const info = await response.json()
+          let svg = ''
+          try {
+            const svgResponse = await fetch(`${base}/pair.svg`)
+            if (svgResponse.ok) svg = await svgResponse.text()
+            else problems.push(`${label} /pair.svg → HTTP ${svgResponse.status}`)
+          } catch (error) {
+            problems.push(`${label} /pair.svg → ${error?.message ?? error}`)
+          }
+          return { base, info, svg }
+        } catch (error) {
+          problems.push(`${label} → ${error?.message ?? error}`)
         }
       }
-      throw new Error('bridge unreachable')
-    }
-
-    function qrSource() {
-      const base = resolvedBase ?? ''
-      return `${base}/pair.svg`
+      return { error: problems.join('；') || 'unknown' }
     }
 
     // 面板开关状态：侧栏按钮和浮层两个槽位共享。
@@ -89,24 +112,32 @@ window.__ModuleLoader__.load({
 
     function PairOverlay() {
       const isOpen = useOpen()
-      const [info, setInfo] = React.useState(null)
+      const [state, setState] = React.useState({ phase: 'idle' })
       const [copied, setCopied] = React.useState(false)
 
       React.useEffect(() => {
-        if (!isOpen) return undefined
+        if (!isOpen) {
+          setState({ phase: 'idle' })
+          return undefined
+        }
         let alive = true
-        bridgeFetch('/pair')
-          .then((response) => response.json())
-          .then((data) => { if (alive) setInfo(data) })
-          .catch(() => { if (alive) setInfo({ error: true }) })
+        setState({ phase: 'loading' })
+        loadPairing().then((result) => {
+          if (!alive) return
+          setState(result.error ? { phase: 'error', message: result.error } : { phase: 'ok', ...result })
+        })
         return () => { alive = false }
       }, [isOpen])
 
       if (!isOpen) return null
 
+      const info = state.phase === 'ok' ? state.info : null
+      const svg = state.phase === 'ok' ? state.svg : ''
+      const base = state.phase === 'ok' ? state.base : ''
       const lan = info?.base ?? ''
       const wan = info?.public?.base ?? ''
       const payload = info?.payload ?? ''
+      const origin = typeof window !== 'undefined' ? window.location.origin : ''
 
       const copy = () => {
         const write = navigator.clipboard?.writeText?.(payload)
@@ -116,10 +147,49 @@ window.__ModuleLoader__.load({
         }).catch(() => setCopied(false))
       }
 
-      return h('div', {
+      const body = []
+      if (state.phase === 'loading') {
+        body.push(h('div', {
+          key: 'loading',
+          style: {
+            width: 224, height: 224, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', color: '#6b7280', fontSize: 13,
+          },
+        }, '正在读取二维码…'))
+      } else if (state.phase === 'error') {
+        body.push(h('div', {
+          key: 'error',
+          style: {
+            width: 224, minHeight: 120, display: 'flex', flexDirection: 'column',
+            gap: 6, justifyContent: 'center', color: '#b91c1c', fontSize: 12,
+            lineHeight: 1.5, wordBreak: 'break-all',
+          },
+        },
+          h('div', null, '取二维码失败'),
+          h('div', { style: { color: '#6b7280' } }, state.message),
+          h('div', { style: { color: '#9ca3af' } }, `页面来源：${origin}`),
+        ))
+      } else if (svg) {
+        body.push(h('img', {
+          key: 'qr',
+          src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`,
+          width: 224, height: 224, alt: '配对二维码',
+          style: { display: 'block', borderRadius: 8, background: '#fff' },
+        }))
+      } else {
+        // 拿不到 SVG 文本时退回让浏览器直接加载图片：<img> 不受 CORS 限制，只要能连通就能出图。
+        body.push(h('img', {
+          key: 'qr-img',
+          src: `${base}/pair.svg?ts=${Date.now()}`,
+          width: 224, height: 224, alt: '配对二维码',
+          style: { display: 'block', borderRadius: 8, background: '#fff' },
+        }))
+      }
+
+      const panel = h('div', {
         onClick: () => setOpen(false),
         style: {
-          position: 'fixed', inset: 0, zIndex: 800, display: 'flex',
+          position: 'fixed', inset: 0, zIndex: 2147483000, display: 'flex',
           alignItems: 'center', justifyContent: 'center',
           background: 'rgba(8,12,22,0.55)', pointerEvents: 'auto',
         },
@@ -141,12 +211,7 @@ window.__ModuleLoader__.load({
             },
           }, '×'),
         ),
-        h('div', { style: { marginTop: 10, background: '#fff', display: 'flex', justifyContent: 'center' } },
-          h('img', {
-            src: qrSource(), width: 224, height: 224, alt: '配对二维码',
-            style: { display: 'block', borderRadius: 8, background: '#fff' },
-          }),
-        ),
+        h('div', { style: { marginTop: 10, background: '#fff', display: 'flex', justifyContent: 'center' } }, body),
         h('div', { style: { marginTop: 12, fontSize: 12, color: '#4b5563' } },
           lan ? `局域网：${lan}` : '局域网：未就绪',
         ),
@@ -155,15 +220,16 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: { marginTop: 14, display: 'flex', gap: 8 } },
           h('button', {
-            type: 'button', onClick: copy,
+            type: 'button', onClick: copy, disabled: !payload,
             style: {
               flex: 1, padding: '9px 12px', borderRadius: 9, border: '1px solid #d1d5db',
               background: copied ? '#dcfce7' : '#f9fafb', color: '#111827',
-              fontSize: 13, cursor: 'pointer',
+              fontSize: 13, cursor: payload ? 'pointer' : 'default',
             },
           }, copied ? '已复制' : '复制配对链接'),
           h('button', {
-            type: 'button', onClick: () => window.open(qrSource(), '_blank'),
+            type: 'button',
+            onClick: () => window.open(`${base}/pair.svg`, '_blank'),
             style: {
               flex: 1, padding: '9px 12px', borderRadius: 9, border: 'none',
               background: '#2563eb', color: '#fff', fontSize: 13, cursor: 'pointer',
@@ -174,6 +240,9 @@ window.__ModuleLoader__.load({
           '手机 App 首页 →「扫一扫」→ 对准屏幕。扫完自动填好地址与令牌，直接进入 DSH。',
         ),
       ))
+
+      const canPortal = createPortal !== null && typeof document !== 'undefined' && document.body
+      return canPortal ? createPortal(panel, document.body) : panel
     }
 
     return {
@@ -192,7 +261,6 @@ window.__ModuleLoader__.load({
 
         ctx.effect(() => () => {
           listeners.clear()
-          resolvedBase = null
         })
       },
     }
