@@ -17,11 +17,19 @@ local.properties
 node_modules/
 *.tgz
 
+# Android（命令行构建产物）
+android/build/
+android/gen/
+android/classes/
+android/*.apk
+android/debug.keystore
+
 # 系统 / 编辑器
 .DS_Store
 Thumbs.db
 .vscode/
 *.log
+
 # 桥的自测产物
 bridge/test/*.log
 bridge/test/*.token

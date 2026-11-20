@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import dgram from 'node:dgram'
+import dns from 'node:dns'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
@@ -300,37 +301,92 @@ export function apply(ctx, config) {
     return { name: os.hostname(), lan, lanAll, public: pub, target, payload }
   }
 
+  // 本机 DNS 对 Cloudflare 域名会抖（NXDOMAIN / i/o timeout），而 *.trycloudflare.com 的解析结果
+  // 永远落在 Cloudflare 的 anycast 边缘上。所以隧道流量配一个专用 lookup：系统 DNS 1.5s 内没答复
+  // 就直接用边缘 IP 顶上，SNI/Host 仍然是原主机名，证书校验和回源都不受影响。
+  const TUNNEL_EDGE_IPS = ['104.16.230.132', '104.16.231.132']
+  let tunnelEdgeCursor = 0
+
+  function nextTunnelEdgeIp() {
+    const ip = TUNNEL_EDGE_IPS[tunnelEdgeCursor % TUNNEL_EDGE_IPS.length]
+    tunnelEdgeCursor += 1
+    return ip
+  }
+
+  /** api.trycloudflare.com 是 cloudflared 的建隧道接口，不能拿边缘 IP 去糊它。 */
+  function isTunnelHost(hostname) {
+    const host = String(hostname ?? '').toLowerCase()
+    return host.endsWith('.trycloudflare.com') && host !== 'api.trycloudflare.com'
+  }
+
+  /** 隧道专用 lookup：先系统 DNS，失败或超时退回 anycast 边缘 IP；force=true 时直接钉边缘 IP。 */
+  function tunnelLookup(hostname, { force = false } = {}) {
+    return (host, options, callback) => {
+      const opts = typeof options === 'function' ? {} : (options ?? {})
+      const cb = typeof options === 'function' ? options : callback
+      const answer = (address) => {
+        if (opts.all) cb(null, [{ address, family: 4 }])
+        else cb(null, address, 4)
+      }
+      if (force) {
+        answer(nextTunnelEdgeIp())
+        return
+      }
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        answer(nextTunnelEdgeIp())
+      }, 1500)
+      if (typeof timer.unref === 'function') timer.unref()
+      dns.lookup(hostname, { family: 4 }, (error, address) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        answer(error || !address ? nextTunnelEdgeIp() : address)
+      })
+    }
+  }
+
   /** 单个 HTTP 探测：2xx/3xx/401 都算"通了"（401 说明 DSH 在跑，只是还没登录）。 */
   function probe(urlString, name) {
     return new Promise((resolve) => {
       const started = Date.now()
-      const done = (ok, detail) => resolve({ name, ok, ms: Date.now() - started, detail })
       try {
         const target = new URL(urlString)
         const secure = target.protocol === 'https:'
-        const request = (secure ? https : http).request({
-          host: target.hostname,
-          port: target.port ? Number(target.port) : (secure ? 443 : 80),
-          path: `${target.pathname}${target.search}`,
-          method: 'GET',
-          timeout: 8000,
-          headers: { host: target.host, accept: 'application/json,text/html' },
-        }, (response) => {
-          let body = ''
-          response.setEncoding('utf8')
-          response.on('data', (chunk) => { body += chunk })
-          response.on('end', () => {
-            const status = response.statusCode ?? 0
-            const ok = (status >= 200 && status < 400) || status === 401
-            const head = body.replace(/\s+/g, ' ').slice(0, 48)
-            done(ok, `HTTP ${status}${head ? ` · ${head}` : ''}`)
+        const tunnelHost = secure && isTunnelHost(target.hostname)
+        const attempt = (force) => new Promise((settle) => {
+          const request = (secure ? https : http).request({
+            host: target.hostname,
+            port: target.port ? Number(target.port) : (secure ? 443 : 80),
+            path: `${target.pathname}${target.search}`,
+            method: 'GET',
+            timeout: 8000,
+            headers: { host: target.host, accept: 'application/json,text/html' },
+            ...(tunnelHost ? { lookup: tunnelLookup(target.hostname, { force }) } : {}),
+          }, (response) => {
+            let body = ''
+            response.setEncoding('utf8')
+            response.on('data', (chunk) => { body += chunk })
+            response.on('end', () => {
+              const status = response.statusCode ?? 0
+              const ok = (status >= 200 && status < 400) || status === 401
+              const head = body.replace(/\s+/g, ' ').slice(0, 48)
+              settle({ ok, detail: `HTTP ${status}${head ? ` · ${head}` : ''}` })
+            })
           })
+          request.on('timeout', () => { request.destroy(); settle({ ok: false, detail: '超时' }) })
+          request.on('error', (error) => settle({ ok: false, detail: error?.code ?? String(error?.message ?? error) }))
+          request.end()
         })
-        request.on('timeout', () => { request.destroy(); done(false, '超时') })
-        request.on('error', (error) => done(false, error?.code ?? String(error?.message ?? error)))
-        request.end()
+        // 隧道流量：系统 DNS 这轮没打通，就钉死边缘 IP 再打一次——本机 DNS 抖动时这是唯一稳的路。
+        const flow = tunnelHost
+          ? attempt(false).then((first) => (first.ok ? first : attempt(true)))
+          : attempt(false)
+        flow.then((result) => resolve({ name, ok: result.ok, ms: Date.now() - started, detail: result.detail }))
       } catch (error) {
-        done(false, String(error?.message ?? error))
+        resolve({ name, ok: false, ms: Date.now() - started, detail: String(error?.message ?? error) })
       }
     })
   }
@@ -349,14 +405,7 @@ export function apply(ctx, config) {
       checks.push(await probe(`${publicUrl}/health`, '隧道 → 桥'))
       checks.push(await probe(`${publicUrl}/`, '隧道 → DSH'))
     } else {
-      checks.push({
-        name: '隧道',
-        ok: false,
-        ms: 0,
-        detail: publicUrl
-          ? '地址已失效或还没就绪（Cloudflare 回收后会重建，稍等或重启 Desktop）'
-          : '未启用（config.tunnel 设为 auto 后重启 Desktop）',
-      })
+      checks.push({ name: '隧道', ok: false, ms: 0, detail: tunnelHint() })
     }
     return {
       ok: checks.every((check) => check.ok),
@@ -887,21 +936,37 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         tunnelVerifiedAt = 0
         publicUrl = ''
         writePublicUrl('')
-        if (tunnelChild) {
+        if (tunnelRestartTimer) {
+          clearTimeout(tunnelRestartTimer)
+          tunnelRestartTimer = null
+        }
+        const dying = tunnelChild
+        if (dying) {
           try {
-            tunnelChild.kill()
+            dying.kill()
           } catch {
-            // 退出事件会负责重启
+            // 进程可能已经没了，下面的 exit/超时会兜住。
           }
-          await new Promise((resolve) => setTimeout(resolve, 1500))
+          // 等它真的退出再拉新的：kill 是异步的，干等固定毫秒数会撞上"tunnelChild 还在 → 不重启"。
+          await new Promise((resolve) => {
+            let finished = false
+            const finish = () => {
+              if (finished) return
+              finished = true
+              clearTimeout(timer)
+              resolve()
+            }
+            const timer = setTimeout(finish, 5000)
+            dying.once('exit', finish)
+          })
         }
         tunnelAttempt = 0
-        if (tunnelTimer) {
-          clearTimeout(tunnelTimer)
-          tunnelTimer = null
+        if (tunnelWaitTimer) {
+          clearTimeout(tunnelWaitTimer)
+          tunnelWaitTimer = null
         }
         // 2) 重新拉起，最多等 120 秒。
-        if (!tunnelChild) startTunnel()
+        startTunnel()
         const deadline = Date.now() + 120_000
         while (Date.now() < deadline) {
           if (publicUrl && tunnelFresh()) break
@@ -1168,12 +1233,19 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   let tunnelChild = null
   /** cloudflared 最近的原始输出，进程快速退出时用来解释原因。 */
   let tunnelTail = []
-  let tunnelTimer = null
+  /** 等 quick tunnel 地址的定时器：到点没地址就把进程杀掉重来。 */
+  let tunnelWaitTimer = null
+  /** 重启 cloudflared 的延时定时器。必须和上面那个分开，否则进程快退时重启链会断（旧代码的坑）。 */
+  let tunnelRestartTimer = null
   let tunnelAttempt = 0
   let tunnelStopped = false
-  // 只有"最近真的从公网打通 /health"的隧道才会写进二维码；否则宁可不给，免得手机扫到死链。
+  /** 本轮 cloudflared 是什么时候拉起的，/pair/test 用它算"已经等了多久"。 */
+  let tunnelStartedAt = 0
+  /** 只有"最近真的从公网打通 /health"的隧道才会写进二维码；否则宁可不给，免得手机扫到死链。 */
   let tunnelVerifiedAt = 0
   let tunnelWatch = null
+  /** 复核连续打不通的次数：quick tunnel 域名会被回收，但单次抖动不该动它。 */
+  let tunnelWatchMisses = 0
   const TUNNEL_FRESH_MS = 15 * 60 * 1000
 
   function tunnelAuthority(value) {
@@ -1184,13 +1256,50 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     return Boolean(publicUrl) && tunnelVerifiedAt > 0 && Date.now() - tunnelVerifiedAt < TUNNEL_FRESH_MS
   }
 
+  /** 隧道当前的完整状态，给 /pair/test、/repair 和日志用。 */
+  function tunnelState() {
+    const mode = String(options.tunnel ?? 'off')
+    const exe = String(options.cloudflaredPath ?? '')
+    return {
+      mode,
+      exe,
+      exeOk: Boolean(exe) && fs.existsSync(exe),
+      running: Boolean(tunnelChild),
+      pid: tunnelChild?.pid ?? 0,
+      startedAt: tunnelStartedAt,
+      waitMs: Number(options.tunnelWaitMs ?? 90_000),
+      attempt: tunnelAttempt,
+      pendingRestart: Boolean(tunnelRestartTimer),
+      url: publicUrl,
+      fresh: tunnelFresh(),
+      tail: tunnelTail.slice(-2).join(' | '),
+    }
+  }
+
+  /**
+   * 隧道不可用时，到底卡在哪一步：开关没开 / 没找到 cloudflared / 正在建 / 正在重试 / 地址没校验过。
+   * 以前不管什么原因都写"未启用（config.tunnel 设为 auto 后重启 Desktop）"，最容易把人带沟里。
+   */
+  function tunnelHint() {
+    const state = tunnelState()
+    if (state.mode !== 'auto') return `未启用：config.tunnel 现在是 ${state.mode}，改成 auto 后重启 Desktop`
+    if (!state.exeOk) return `未启用：找不到 cloudflared（cloudflaredPath=${state.exe || '空'}）`
+    if (state.running) {
+      const waited = state.startedAt > 0 ? Math.round((Date.now() - state.startedAt) / 1000) : 0
+      return `cloudflared 正在建隧道 pid=${state.pid}（已等 ${waited}s，超过 ${Math.round(state.waitMs / 1000)}s 没地址会自动重来）`
+    }
+    if (state.pendingRestart) return `cloudflared 刚退出，正在自动重试（已失败 ${state.attempt} 次）`
+    if (state.url) return `地址 ${state.url} 还没通过公网校验（本机 DNS 抖动时会在 Cloudflare 边缘 IP 上重试）`
+    return `cloudflared 没有在跑，也没有排重试（看日志 ~/.dsh/dshremote-bridge.log 尾部${state.tail ? `：${state.tail}` : ''}）`
+  }
+
   function scheduleTunnel(delayMs) {
-    if (tunnelStopped || tunnelTimer) return
-    tunnelTimer = setTimeout(() => {
-      tunnelTimer = null
+    if (tunnelStopped || tunnelRestartTimer || tunnelChild) return
+    tunnelRestartTimer = setTimeout(() => {
+      tunnelRestartTimer = null
       startTunnel()
     }, delayMs)
-    if (typeof tunnelTimer.unref === 'function') tunnelTimer.unref()
+    if (typeof tunnelRestartTimer.unref === 'function') tunnelRestartTimer.unref()
   }
 
   function adoptTunnelUrl(url) {
@@ -1208,6 +1317,11 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   function verifyTunnelSoon(clean, authority, attempt = 1) {
     verifyTunnel(clean, authority).then((ok) => {
       if (ok) {
+        // 地址已经拿到并校验通过，就别再让"等地址"的看门狗到点把这只好隧道杀掉。
+        if (tunnelWaitTimer) {
+          clearTimeout(tunnelWaitTimer)
+          tunnelWaitTimer = null
+        }
         if (clean !== publicUrl) {
           publicUrl = clean
           trustHost(authority)
@@ -1216,6 +1330,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         }
         tunnelVerifiedAt = Date.now()
         tunnelAttempt = 0
+        tunnelWatchMisses = 0
         return
       }
       if (attempt >= 3) {
@@ -1237,12 +1352,26 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       verifyTunnel(publicUrl, authority).then((ok) => {
         if (ok) {
           tunnelVerifiedAt = Date.now()
+          tunnelWatchMisses = 0
           return
         }
+        tunnelWatchMisses += 1
+        // 连续两次打不通才认死：一次失败可能只是网络抖。真死了就杀掉 cloudflared，
+        // 让退出事件走自动重连，换一条新域名回来。
+        if (tunnelWatchMisses < 2) return
+        tunnelWatchMisses = 0
         if (tunnelVerifiedAt > 0) {
           log(`隧道 ${publicUrl} 已失效，等待新地址`)
         }
         tunnelVerifiedAt = 0
+        if (tunnelChild) {
+          log('隧道域名疑似被回收，重启 cloudflared 换新地址')
+          try {
+            tunnelChild.kill()
+          } catch {
+            // 交给退出事件。
+          }
+        }
       })
     }, 60_000)
     if (typeof tunnelWatch.unref === 'function') tunnelWatch.unref()
@@ -1250,7 +1379,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
 
   /** 从本机经隧道打一次 /health，确认这条隧道真的能用。 */
   function verifyTunnel(base, authority) {
-    return new Promise((resolve) => {
+    const host = String(authority ?? '').replace(/:\d+$/, '')
+    const tunnelHost = isTunnelHost(host)
+    const attempt = (force) => new Promise((resolve) => {
       let settled = false
       const done = (ok) => {
         if (settled) return
@@ -1265,6 +1396,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           method: 'GET',
           timeout: 8000,
           headers: { host: authority },
+          ...(tunnelHost ? { lookup: tunnelLookup(host, { force }) } : {}),
         }, (response) => {
           let body = ''
           response.setEncoding('utf8')
@@ -1278,6 +1410,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         done(false)
       }
     })
+    // 系统 DNS 这轮没打通就钉边缘 IP 再验一次，避免把好隧道当成死链丢掉。
+    return attempt(false).then((ok) => (ok || !tunnelHost ? ok : attempt(true)))
   }
 
   function startTunnel() {
@@ -1285,7 +1419,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     if (String(options.tunnel ?? 'off') !== 'auto') return
     const exe = String(options.cloudflaredPath ?? '')
     if (!exe || !fs.existsSync(exe)) {
-      log(`隧道未启动：找不到 cloudflared（${exe}）`)
+      // 路径配错或者还没装好也要隔一会儿重来：把 cloudflared 放对位置后不用重启 Desktop 就能自愈。
+      log(`隧道未启动：找不到 cloudflared（${exe || '未配置 cloudflaredPath'}），60s 后再试`)
+      scheduleTunnel(60_000)
       return
     }
     const args = [
@@ -1307,6 +1443,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     }
     tunnelChild = child
     tunnelTail = []
+    tunnelStartedAt = Date.now()
     log(`隧道启动中 pid=${child.pid}`)
 
     const onData = (chunk) => {
@@ -1323,9 +1460,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     child.stdout?.on('data', onData)
     child.stderr?.on('data', onData)
     // cloudflared 偶尔会卡在建隧道阶段（连上 edge 但迟迟不给 quick tunnel 地址），到点就重来。
-    if (tunnelTimer) clearTimeout(tunnelTimer)
-    tunnelTimer = setTimeout(() => {
-      tunnelTimer = null
+    if (tunnelWaitTimer) clearTimeout(tunnelWaitTimer)
+    tunnelWaitTimer = setTimeout(() => {
+      tunnelWaitTimer = null
       if (tunnelChild !== child) return
       log(`隧道 ${Math.round(Number(options.tunnelWaitMs ?? 90000) / 1000)}s 内没拿到地址，重启 cloudflared`)
       try {
@@ -1334,10 +1471,16 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         // 杀不掉就让退出事件走重启流程。
       }
     }, Number(options.tunnelWaitMs ?? 90000))
-    if (typeof tunnelTimer.unref === 'function') tunnelTimer.unref()
+    if (typeof tunnelWaitTimer.unref === 'function') tunnelWaitTimer.unref()
     child.on('error', (error) => log(`隧道进程错误：${error?.message ?? error}`))
     child.on('exit', (code) => {
-      tunnelChild = null
+      if (tunnelChild === child) tunnelChild = null
+      // 关键：退出时把"等地址"的定时器清掉。旧代码把它和"重启延时"共用一个变量，
+      // 于是 scheduleTunnel 看到非空就 return，cloudflared 一快退自愈链就永久断掉。
+      if (tunnelWaitTimer) {
+        clearTimeout(tunnelWaitTimer)
+        tunnelWaitTimer = null
+      }
       if (tunnelStopped) return
       tunnelAttempt += 1
       const delay = Math.min(60_000, 5_000 * tunnelAttempt)
@@ -1382,9 +1525,13 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         tunnelWatch = null
       }
       tunnelStopped = true
-      if (tunnelTimer) {
-        clearTimeout(tunnelTimer)
-        tunnelTimer = null
+      if (tunnelWaitTimer) {
+        clearTimeout(tunnelWaitTimer)
+        tunnelWaitTimer = null
+      }
+      if (tunnelRestartTimer) {
+        clearTimeout(tunnelRestartTimer)
+        tunnelRestartTimer = null
       }
       try {
         tunnelChild?.kill()
