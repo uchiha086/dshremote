@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/uchiha086/dshremote?color=orange)](https://github.com/uchiha086/dshremote/releases)
 
-![桌面图标](docs/phone-icon.jpeg)
+<img src="docs/icon.png" width="128" alt="DSH Remote 图标">
 
 ---
 
@@ -29,9 +29,9 @@ DSH 是个桌面版 Agent，人离开了电脑就没法盯进度。现有的远�
 
 ## 看图
 
-| 手机里的 DSH | 回合完成通知 |
-|---|---|
-| ![DSH 全屏](docs/phone-dsh.jpeg) | ![回合通知](docs/phone-notify.jpeg) |
+手机里打开就是完整的 DSH：会话列表、流式回复、模型选择、审批都在；回合结束手机通知栏会弹一条「会话标题 · done + 回复开头」。
+
+![手机里的 DSH](docs/phone-dsh.jpeg)
 
 ## 特性
 
