@@ -9,6 +9,21 @@ const DOMAIN = 0x0000;
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'dshremote', '%{public}s', 'Ability onCreate');
+    this.handleWant(want);
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    hilog.info(DOMAIN, 'dshremote', '%{public}s', 'Ability onNewWant');
+    this.handleWant(want);
+  }
+
+  /** 系统相机扫到 dshremote:// 链接时会直接拉起本应用，把 uri 交给页面去配对。 */
+  private handleWant(want: Want): void {
+    const uri = want?.uri ?? '';
+    if (uri.startsWith('dshremote://pair')) {
+      hilog.info(DOMAIN, 'dshremote', '收到配对链接 %{public}s', uri.substring(0, 40));
+      AppStorage.setOrCreate<string>('pairUri', uri);
+    }
   }
 
   onDestroy(): void {

@@ -1,9 +1,11 @@
 import crypto from 'node:crypto'
+import dgram from 'node:dgram'
 import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { svgOf } from './qr.mjs'
 import { createWebSocketServer } from './websocket.mjs'
 
 /** 桥插件版本，手机端据此判断兼容性。 */
@@ -36,6 +38,12 @@ const DEFAULT_OPTIONS = {
   tokenFile: '',
   hostsFile: '',
   extraHosts: [],
+  // 当前对外的公网地址（Cloudflare 隧道域名等）；隧道地址会变，所以既能写配置也能运行时通过 /public 存入文件。
+  publicUrl: '',
+  publicUrlFile: '',
+  // 局域网自动发现：往 3089 端口广播自己，手机 App 监听即可自动列出电脑，不用手填 IP。
+  discovery: true,
+  discoveryPort: 3089,
 }
 
 /** 读已保存的 token；只认长十六进制串，避免把脏内容当口令用。 */
@@ -127,6 +135,131 @@ export function apply(ctx, config) {
   // 把本机各网卡 IPv4（桥端口 + 反代端口）注册进去，避免写死某个 IP。
   const trustedList = ctx.connection?.trustedHosts
   const hostsFile = expandHome(options.hostsFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.hosts')
+  const publicUrlFile = expandHome(options.publicUrlFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.public')
+
+  /** 读上次落盘的公网地址（隧道域名重启会变，靠它记住最近一次）。 */
+  function readPublicUrl() {
+    try {
+      const text = fs.readFileSync(publicUrlFile, 'utf8').trim()
+      return /^https?:\/\/[^\s]+$/i.test(text) ? text : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function writePublicUrl(value) {
+    try {
+      fs.mkdirSync(path.dirname(publicUrlFile), { recursive: true })
+      fs.writeFileSync(publicUrlFile, `${value}\n`, 'utf8')
+    } catch (error) {
+      log(`公网地址落盘失败：${error?.message ?? error}`)
+    }
+  }
+
+  let publicUrl = String(options.publicUrl ?? '').trim().replace(/\/+$/, '') || readPublicUrl()
+
+  /**
+   * 本机联网用的 IPv4（不含回环），按"手机更可能连上"的顺序排。
+   * Windows 上常同时有 WLAN、VirtualBox、WSL/VMware 虚拟网卡，虚拟网卡的地址手机根本到不了，
+   * 所以先靠一次 UDP connect 问出系统真正走默认路由的网卡地址，再按网卡名给其余地址打分。
+   */
+  let primaryIp = ''
+
+  function detectPrimaryIp() {
+    return new Promise((resolve) => {
+      const socket = dgram.createSocket('udp4')
+      let settled = false
+      const done = (value) => {
+        if (settled) return
+        settled = true
+        try {
+          socket.close()
+        } catch {
+          // 已经关掉了。
+        }
+        resolve(value)
+      }
+      socket.on('error', () => done(''))
+      socket.connect(53, '223.5.5.5', () => {
+        try {
+          done(String(socket.address()?.address ?? ''))
+        } catch {
+          done('')
+        }
+      })
+      setTimeout(() => done(''), 400)
+    })
+  }
+
+  function lanAddresses() {
+    const preferName = [/wlan|wi-?fi|无线/i]
+    const avoidName = [/virtualbox|vmware|hyper-v|vethernet|docker|loopback|bluetooth|蓝牙|tap|tun|npcap|tailscale/i]
+    const items = []
+    try {
+      for (const [name, list] of Object.entries(os.networkInterfaces())) {
+        for (const item of list ?? []) {
+          if (!item || item.family !== 'IPv4' || item.internal) continue
+          let score = 0
+          if (item.address === primaryIp) score += 100
+          if (preferName.some((re) => re.test(name))) score += 10
+          if (avoidName.some((re) => re.test(name))) score -= 10
+          if (/^192\.168\./.test(item.address)) score += 3
+          if (/^169\.254\./.test(item.address)) score -= 5
+          items.push({ address: item.address, score })
+        }
+      }
+    } catch {
+      // 拿不到网卡就当没有局域网地址。
+    }
+    items.sort((a, b) => b.score - a.score)
+    return items.map((item) => item.address)
+  }
+
+  /** 请求是从公网（隧道域名）进来的吗——只影响二维码里优先给哪个地址。 */
+  function looksPublic(host) {
+    const name = String(host ?? '').split(':')[0].toLowerCase()
+    if (!name) return false
+    if (name === 'localhost' || name === '127.0.0.1') return false
+    if (/^10\./.test(name) || /^192\.168\./.test(name)) return false
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(name)) return false
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(name)) return false
+    return true
+  }
+
+  /**
+   * 生成配对信息：局域网地址 + 公网地址都给，二维码里编码"当下最该用的那个"。
+   * 手机扫到后写入配置，就不用再手抄 IP 和 token。
+   */
+  function pairing(hostHeader) {
+    const ips = lanAddresses()
+    const ip = ips[0] ?? '127.0.0.1'
+    const lanAll = ips.length > 0
+      ? ips.map((address) => ({ base: `http://${address}:${options.port}`, web: `http://${address}:${options.proxyPort}` }))
+      : [{ base: `http://${ip}:${options.port}`, web: `http://${ip}:${options.proxyPort}` }]
+    const lan = lanAll[0]
+    const pub = publicUrl ? { base: publicUrl, web: publicUrl } : null
+    const choosePublic = pub && looksPublic(hostHeader)
+    const target = choosePublic ? pub : lan
+    const payload = `dshremote://pair?v=1&name=${encodeURIComponent(os.hostname())}&base=${encodeURIComponent(target.base)}&web=${encodeURIComponent(target.web)}&token=${token}`
+    return { name: os.hostname(), lan, lanAll, public: pub, target, payload }
+  }
+
+  /** 手机扫码/自动发现后要能连上，这里统一给一份 JSON。 */
+  function pairingJson(hostHeader) {
+    const info = pairing(hostHeader)
+    return {
+      ok: true,
+      v: 1,
+      name: info.name,
+      payload: info.payload,
+      base: info.target.base,
+      web: info.target.web,
+      lan: info.lan,
+      lanAll: info.lanAll,
+      public: info.public,
+      proxyPort: options.proxyPort,
+    }
+  }
 
   /** 把一个 authority（host 或 host:port）登记进 DSH 的白名单；重复登记无害。 */
   function trustHost(authority) {
@@ -486,6 +619,85 @@ export function apply(ctx, config) {
       return
     }
 
+    if (url.pathname === '/pair') {
+      // 本地（回环/局域网）扫码本来就该拿到 token；从公网转发进来则要求带上 token，避免把口令送到隧道里。
+      const host = String(request.headers.host ?? '')
+      if (looksPublic(host) && url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify(pairingJson(host)))
+      return
+    }
+
+    if (url.pathname === '/pair.svg' || url.pathname === '/pair.png') {
+      const host = String(request.headers.host ?? '')
+      if (looksPublic(host) && url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      try {
+        const svg = svgOf(pairing(host).payload, { scale: 8, margin: 4 })
+        response.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-store' })
+        response.end(svg)
+      } catch (error) {
+        log(`二维码生成失败：${error?.message ?? error}`)
+        response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'qr-failed' }))
+      }
+      return
+    }
+
+    if (url.pathname === '/pair.html') {
+      const host = String(request.headers.host ?? '')
+      const info = pairing(host)
+      const tokenParam = url.searchParams.get('token')
+      const suffix = tokenParam ? `?token=${encodeURIComponent(tokenParam)}` : ''
+      const publicNote = info.public ? `公网地址：${info.public.base}` : '公网地址：未设置（只在局域网内可扫）'
+      const html = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>DSH Remote 配对</title>
+<style>
+body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:32px;background:#0f1626;color:#e8eefc;display:flex;flex-direction:column;align-items:center}
+h1{font-size:20px;margin:0 0 6px}p{margin:4px 0;font-size:13px;color:#9fb0d0}
+.card{background:#fff;padding:16px;border-radius:16px;margin:18px 0}
+code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-radius:8px;display:block;max-width:520px}
+</style></head><body>
+<h1>用手机 App 扫这个码</h1>
+<p>App 首页 →「扫一扫」→ 对准屏幕。扫完会自动填好地址与 token。</p>
+<div class="card"><img src="/pair.svg${suffix}" width="280" height="280" alt="pairing qr"/></div>
+<p>${publicNote}</p>
+<code>${info.payload}</code>
+</body></html>`
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(html)
+      return
+    }
+
+    if (url.pathname === '/public') {
+      if (url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      const value = String(url.searchParams.get('url') ?? '').trim()
+      if (value) {
+        if (!/^https?:\/\/[^\s/]+/i.test(value)) {
+          response.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+          response.end(JSON.stringify({ ok: false, error: 'bad-url' }))
+          return
+        }
+        publicUrl = value.replace(/\/+$/, '')
+        writePublicUrl(publicUrl)
+        log(`公网地址=${publicUrl}`)
+      }
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify({ ok: true, public: publicUrl || null }))
+      return
+    }
+
     // 其余路径原样转给 DSH：这样一条隧道（指向 3088）就能同时当网页入口和控制接口用。
     proxyRequest(request, response)
   })
@@ -613,10 +825,55 @@ export function apply(ctx, config) {
     })
   }
 
+  // 局域网自动发现：每 2 秒往广播地址喊一声自己是谁。手机 App 监听同端口即可列出电脑，免手填 IP。
+  // 广播只在同一个网段内可见，安全性等同"连着同一个 Wi-Fi"，不想暴露就把 discovery 关掉。
+  let beaconSocket = null
+  let beaconTimer = null
+  function startBeacon() {
+    if (!options.discovery) return
+    const socket = dgram.createSocket({ type: 'udp4' })
+    beaconSocket = socket
+    socket.on('error', (error) => {
+      log(`自动发现广播失败：${error?.message ?? error}`)
+      try {
+        socket.close()
+      } catch {
+        // 已经关了就算了。
+      }
+    })
+    socket.bind(() => {
+      try {
+        socket.setBroadcast(true)
+      } catch (error) {
+        log(`打开广播权限失败：${error?.message ?? error}`)
+      }
+      const send = () => {
+        const body = Buffer.from(JSON.stringify({
+          svc: 'dshremote',
+          v: 1,
+          name: os.hostname(),
+          port: options.port,
+          proxy: options.proxyEnabled ? options.proxyPort : null,
+          lan: lanAddresses(),
+          public: publicUrl || null,
+          token,
+        }), 'utf8')
+        socket.send(body, 0, body.length, options.discoveryPort, '255.255.255.255', () => {
+          // 广播发不出去（比如没有网卡）不影响其它功能。
+        })
+      }
+      send()
+      beaconTimer = setInterval(send, 2000)
+      log(`自动发现已开启 udp://255.255.255.255:${options.discoveryPort}`)
+    })
+  }
+
   ctx.effect(() => {
     void (async () => {
       await listen(server, options.port, options.bind, 'bridge')
       if (proxy) await listen(proxy, options.proxyPort, options.bind, '反代')
+      primaryIp = await detectPrimaryIp()
+      startBeacon()
       try {
         fs.mkdirSync(path.dirname(tokenFile), { recursive: true })
         if (readToken(tokenFile) !== token) {
@@ -631,6 +888,12 @@ export function apply(ctx, config) {
 
     return () => {
       clearInterval(heartbeat)
+      clearInterval(beaconTimer)
+      try {
+        beaconSocket?.close()
+      } catch {
+        // 关不掉忽略。
+      }
       disposeEvents?.()
       disposeStatus?.()
       for (const client of clients) {

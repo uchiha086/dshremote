@@ -73,11 +73,23 @@ try {
   $trusted = "失败：$($_.Exception.Message)"
 }
 
+# 把当前公网地址告诉桥：二维码和自动发现广播都会带上它，手机扫一次就换到新隧道。
+$publicUrl = "http://127.0.0.1:$BridgePort/public?token=$Token&url=$([uri]::EscapeDataString($url))"
+$published = 'no'
+try {
+  $resp = Invoke-WebRequest -Uri $publicUrl -UseBasicParsing -TimeoutSec 10
+  $published = if ($resp.StatusCode -eq 200) { 'yes' } else { "HTTP $($resp.StatusCode)" }
+} catch {
+  $published = "失败：$($_.Exception.Message)"
+}
+
 Write-Host ''
 Write-Host "隧道地址  : $url"
 Write-Host "已登记信任: $trusted（$authority）"
+Write-Host "已发布地址: $published"
 Write-Host "传输协议  : $Protocol"
 Write-Host "PID       : $($proc.Id)    日志: $log"
 Write-Host ''
-Write-Host '手机端：设置 → 隧道地址 填上面这个 URL，然后「保存并进入」。'
+Write-Host '手机端：电脑上打开 http://127.0.0.1:3088/pair.html 出二维码，App「扫一扫」即可；'
+Write-Host '       同一个 Wi-Fi 下也可以直接点「自动发现」。'
 Write-Host '（隧道地址每次重启都会变；电脑重启后重新跑一次本脚本即可）'

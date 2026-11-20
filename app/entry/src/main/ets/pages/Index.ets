@@ -1,8 +1,11 @@
 import { common } from '@kit.AbilityKit';
+import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { webview } from '@kit.ArkWeb';
 import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
 import { BridgeHttp, BridgePoller, TurnEndEvent } from '../common/BridgeClient';
+import { Discovery, FoundHost } from '../common/Discovery';
 import { Notifier } from '../common/Notifier';
+import { applyPairing, parsePairing, PairResult } from '../common/Pairing';
 
 @Entry
 @Component
@@ -17,7 +20,12 @@ struct Index {
   @State busy: boolean = false;
   @State webUrl: string = '';
   @State webReady: boolean = false;
+  @State foundName: string = '';
+  @State hasFound: boolean = false;
+  @StorageLink('pairUri') @Watch('onPairUriChanged') pairUri: string = '';
 
+  private found: FoundHost = new FoundHost();
+  private discovery: Discovery = new Discovery();
   private controller: webview.WebviewController = new webview.WebviewController();
   private cfg: BridgeConfig = new BridgeConfig();
   private poller: BridgePoller = new BridgePoller();
@@ -25,6 +33,15 @@ struct Index {
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
     Notifier.enable(context);
+    this.discovery.onFound = (host: FoundHost) => {
+      this.found = host;
+      this.foundName = host.name;
+      this.hasFound = true;
+      this.testResult = `发现电脑：${host.name}，点「连接」即可`;
+    };
+    this.discovery.onError = (message: string) => {
+      this.foundName = message;
+    };
     ConfigStore.init(context).then(async () => {
       const loaded = await ConfigStore.load();
       this.cfg = loaded;
@@ -37,12 +54,14 @@ struct Index {
         await this.enterMain();
       } else {
         this.stage = 'setup';
+        this.discovery.start();
       }
     });
   }
 
   aboutToDisappear(): void {
     this.poller.stop();
+    this.discovery.stop();
   }
 
   private readForm(): BridgeConfig {
@@ -85,9 +104,74 @@ struct Index {
     await this.enterMain();
   }
 
+  /** 系统相机扫到的配对链接会通过 AppStorage 送进来。 */
+  onPairUriChanged(): void {
+    if (this.pairUri.length === 0) {
+      return;
+    }
+    const text = this.pairUri;
+    this.pairUri = '';
+    AppStorage.setOrCreate<string>('pairUri', '');
+    this.applyPairText(text);
+  }
+
+  private applyPairText(raw: string): void {
+    const result: PairResult = parsePairing(raw);
+    if (!result.ok) {
+      this.testResult = result.error;
+      return;
+    }
+    const cfg = this.readForm();
+    applyPairing(cfg, result);
+    this.cfg = cfg;
+    this.hostInput = cfg.host;
+    this.portInput = `${cfg.port}`;
+    this.tokenInput = cfg.token;
+    this.tunnelInput = cfg.tunnel;
+    this.testResult = `已配对：${result.name}`;
+    this.saveAndEnter();
+  }
+
+  private async scanPair(): Promise<void> {
+    try {
+      const options: scanBarcode.ScanOptions = {
+        scanTypes: [scanCore.ScanType.ALL],
+        enableMultiMode: false,
+        enableAlbum: true,
+      };
+      const context = getContext(this) as common.UIAbilityContext;
+      const result = await scanBarcode.startScanForResult(context, options);
+      const text = result.originalValue ?? '';
+      if (text.length > 0) {
+        this.applyPairText(text);
+      }
+    } catch (error) {
+      this.testResult = '扫码取消或失败';
+    }
+  }
+
+  private async connectFound(): Promise<void> {
+    const cfg = this.readForm();
+    cfg.host = this.found.base.replace('http://', '').split(':')[0];
+    const basePort = Number(this.found.base.split(':').pop());
+    cfg.port = Number.isFinite(basePort) && basePort > 0 ? basePort : 3088;
+    const webPort = Number(this.found.web.split(':').pop());
+    cfg.proxyPort = Number.isFinite(webPort) && webPort > 0 ? webPort : 7627;
+    cfg.token = this.found.token;
+    cfg.tunnel = '';
+    this.cfg = cfg;
+    this.hostInput = cfg.host;
+    this.portInput = `${cfg.port}`;
+    this.tokenInput = cfg.token;
+    this.tunnelInput = '';
+    this.testResult = `连接 ${this.found.name}…`;
+    await this.saveAndEnter();
+  }
+
   private async enterMain(): Promise<void> {
     const lanBase = this.cfg.webUrl();
     this.webReady = false;
+    this.discovery.stop();
     this.poller.onStatus = (text: string) => {
       this.statusText = text;
     };
@@ -127,11 +211,29 @@ struct Index {
   setupView() {
     Column({ space: 14 }) {
       Text('连接你的电脑').fontSize(26).fontWeight(FontWeight.Bold)
-      Text('先在电脑上装好 dshremote-bridge 插件，把它的 token 填进来')
+      Text('先在电脑上装好 dshremote-bridge 插件，用「扫一扫」或「自动发现」配对，也可以手动填')
         .fontSize(13)
         .fontColor('#666666')
         .textAlign(TextAlign.Center)
         .padding({ left: 24, right: 24 })
+
+      Row({ space: 12 }) {
+        Button('扫一扫配对')
+          .enabled(!this.busy)
+          .onClick(() => {
+            this.scanPair();
+          })
+        Button(this.hasFound ? `连接 ${this.foundName}` : '自动发现')
+          .enabled(!this.busy)
+          .onClick(() => {
+            if (this.hasFound) {
+              this.connectFound();
+            } else {
+              this.testResult = '正在搜索同一 Wi-Fi 下的电脑…';
+              this.discovery.start();
+            }
+          })
+      }
 
       TextInput({ placeholder: '电脑 IP，例如 192.168.68.225', text: this.hostInput })
         .onChange((value: string) => {
@@ -201,6 +303,7 @@ struct Index {
             this.poller.stop();
             this.statusText = '已断开';
             this.stage = 'setup';
+            this.discovery.start();
           })
       }
       .width('100%')

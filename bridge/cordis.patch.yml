@@ -20,3 +20,11 @@
         # 都会被塞进 DSH 的 trustedHosts，否则公网访问会被 403 forbidden。
         extraHosts: []
         hostsFile: ''
+        # 当前对外的公网地址（例如 Cloudflare 隧道域名）。二维码和自动发现都会带上它；
+        # 隧道地址每次重启会变，所以运行时用 GET /public?token=…&url=… 更新即可，自动落盘。
+        publicUrl: ''
+        publicUrlFile: ''
+        # 局域网自动发现：每 2 秒向 255.255.255.255:3089 广播「我是谁、在哪、口令」，
+        # 手机 App 监听同一端口就能免手填直接连。不想暴露就设成 false。
+        discovery: true
+        discoveryPort: 3089
