@@ -24,6 +24,8 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+
+import org.json.JSONObject;
 import android.widget.TextView;
 
 /**
@@ -80,12 +82,15 @@ public class MainActivity extends Activity {
         String raw = data.toString();
         if (!PairLink.looksLikePairLink(raw)) return;
         PairLink link = PairLink.parse(raw);
-        if (link.token.isEmpty()) {
-            statusMessage = "配对链接里没有 token，请重新扫码";
+        // v2 只有一次性 code，没有 token；token 要等用户在设置页点「连接」时才换。
+        if (link.token.isEmpty() && link.code.isEmpty()) {
+            statusMessage = "配对链接里既没有口令也没有一次性码，请重新扫码";
             return;
         }
-        cfg.apply(link);
-        cfg.save(this);
+        if (!link.token.isEmpty()) {
+            cfg.apply(link);
+            cfg.save(this);
+        }
         pendingLink = raw;
         statusMessage = "已从二维码读取配置";
     }
@@ -93,6 +98,11 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- setup screen
 
     private void showSetup(String message) {
+        WebView old = currentWebView();
+        if (old != null) {
+            root.removeView(old);
+            old.destroy();
+        }
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setBackgroundColor(Color.WHITE);
@@ -156,11 +166,10 @@ public class MainActivity extends Activity {
         col.addView(connectBtn, connectLp);
 
         TextView foot = new TextView(this);
-        foot.setText("v0.2.0 · 电脑端需要 dshremote-bridge 插件");
+        foot.setText("v0.2.1 · 电脑端需要 dshremote-bridge 插件");
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         foot.setTextColor(Color.rgb(160, 160, 160));
-        foot.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams footLp = matchWrap();
+        foot.setGravity(Gravity.CENTER);        LinearLayout.LayoutParams footLp = matchWrap();
         footLp.topMargin = dp(24);
         col.addView(foot, footLp);
 
@@ -171,20 +180,36 @@ public class MainActivity extends Activity {
                 PairLink link = PairLink.parse(raw);
                 if (link.token.isEmpty()) link.token = token;
                 cfg.apply(link);
+                // v2 二维码里只有 60 秒一次性码：真正连之前先换成 token。
+                if (link.token.isEmpty() && !link.code.isEmpty()) {
+                    String claimBase = !link.base.isEmpty() ? link.base : link.tunnel;
+                    final String code = link.code;
+                    final String base = claimBase;
+                    status.setText("正在用一次性码换取访问凭证…");
+                    new Thread(() -> {
+                        JSONObject claimed = Http.claim(base, code);
+                        final String claimedToken = claimed == null ? "" : claimed.optString("token", "");
+                        final String claimedTunnel = claimed == null ? "" : claimed.optString("tunnel", "");
+                        runOnUiThread(() -> {
+                            if (claimedToken.isEmpty()) {
+                                status.setText("配对码已失效（60 秒过期），请回电脑刷新二维码");
+                                return;
+                            }
+                            cfg.token = claimedToken;
+                            if (!claimedTunnel.isEmpty()) cfg.tunnel = claimedTunnel;
+                            cfg.save(this);
+                            afterClaim();
+                        });
+                    }, "dshremote-claim").start();
+                    return;
+                }
             } else if (!token.isEmpty()) {
                 cfg.token = token;
                 if (!raw.isEmpty() && cfg.host.isEmpty() && cfg.tunnel.isEmpty()) {
                     cfg.host = raw.replace("http://", "").replace("https://", "");
                 }
             }
-            cfg.save(this);
-            if (!cfg.valid()) {
-                status.setText("还缺地址或 token");
-                return;
-            }
-            status.setText("正在连接…");
-            showMain();
-            connect();
+            afterClaim();
         });
 
         root = new FrameLayout(this);
@@ -194,7 +219,26 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- main screen
 
+    /** 拿到 token 之后的统一入口：校验配置 → 进主界面 → 连接。 */
+    private void afterClaim() {
+        cfg.save(this);
+        if (!cfg.valid()) {
+            statusMessage = "还缺地址或 token";
+            showSetup(statusMessage);
+            return;
+        }
+        pendingLink = "";
+        showMain();
+        connect();
+    }
+
     private void showMain() {
+        WebView old = currentWebView();
+        if (old != null) {
+            // 换页必须先销毁旧 WebView，否则页面里的定时器与监听会一直活着。
+            root.removeView(old);
+            old.destroy();
+        }
         root = new FrameLayout(this);
         WebView web = buildWebView();
         root.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -274,9 +318,28 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> {
                 WebView web = currentWebView();
                 if (web != null) web.loadUrl(target);
-                PollService.start(this);
             });
         }, "dshremote-connect").start();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 前台服务只能在"用户看得见界面"时拉起，否则 Android 12+ 会直接抛
+        // ForegroundServiceStartNotAllowedException。放到 onResume 里最稳。
+        if (cfg != null && cfg.valid()) {
+            PollService.start(this);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        WebView web = currentWebView();
+        if (web != null) {
+            root.removeView(web);
+            web.destroy();
+        }
+        super.onDestroy();
     }
 
     // ---------------------------------------------------------------- helpers

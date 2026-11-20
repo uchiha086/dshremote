@@ -62,10 +62,13 @@ dsh plugin --profile desktop add -w C:\Users\user\Desktop\dshremote\bridge
 ## HTTP 调试接口
 
 - `GET /health` —— 不需要 token，返回版本、在线客户端数、会话数、反代端口。
-- `GET /events?token=<token>` —— 最近 100 条事件，用于手机重连后补拉。
+- `GET /events?afterSeq=<seq>`（推荐，头里带 `X-DSH-Token`）—— 拉取 `seq` 之后的事件，响应里带 `latestSeq`；`?token=` 与 `since=<毫秒>` 仍兼容但已弃用。
 
 ## 安全说明
 
-- token 只在 `auth` 帧里传，**不走 URL**，避免进浏览器历史与代理日志。
+- token 一律走 `X-DSH-Token`（或 `Authorization: Bearer`）请求头；`?token=` 只为老客户端兼容保留，会进代理日志，**不要用**。
+- 二维码里不再有 token：0.2.1 起是 `v=2` 的一次性配对码（60 秒、单次、换完即废），手机扫到后调 `POST/GET /pair/claim` 换回 token。
+- `/pair`、`/pair.svg`、`/pair.html`、`/pair/test`、`/pair/claim`、`/repair`、`/ai-fix`、`/public` 全部要求 token；`/ai-fix` 还要求请求来自回环地址（否则 403），并对每个来源限流。
+- UDP 发现广播里**不含 token**，默认关闭（`discovery: false`），只用来告诉手机「电脑在哪」。
 - 默认 `bind 0.0.0.0` 只适合**可信局域网**；要跨网请走 Cloudflare Tunnel，并把 ingress 指到 `127.0.0.1:3088`，不要直接把 3088 暴露公网。
 - 反代是裸 TCP 透传，不解析内容；DSH Web 自己的鉴权仍然生效。

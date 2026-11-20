@@ -1,4 +1,6 @@
-import { WebSocket } from 'ws'
+// 冒烟自测：健康检查、事件总线、鉴权边界。
+// 用假 ctx 起一份桥，不需要真的 DSH 宿主（也不连网络）。
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { apply } from '../lib/index.mjs'
@@ -11,6 +13,8 @@ const handlers = new Map()
 let disposer = null
 
 const ctx = {
+  webServer: { port: 7999 },
+  connection: { trustedHosts: [], browserAuth: null },
   on(name, fn) {
     handlers.set(name, fn)
     return () => handlers.delete(name)
@@ -28,25 +32,26 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` — ${detail}` : ''}`)
 }
 
-function openSocket() {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, 'dshremote-bridge-v1')
-    ws.once('open', () => resolve(ws))
-    ws.once('error', reject)
-  })
-}
-
-function nextFrame(ws, timeoutMs = 3000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timeout waiting frame')), timeoutMs)
-    ws.once('message', (raw) => {
-      clearTimeout(timer)
-      resolve(JSON.parse(String(raw)))
-    })
-  })
-}
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 用自建请求发，才能控制 Host 头（模拟经隧道域名访问）。 */
+function request(pathname, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: PORT, path: pathname, method: 'GET', headers },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => { body += chunk })
+        res.on('end', () => resolve({ status: res.statusCode, body }))
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
+const PUBLIC_HOST = 'dsh.example.com'
 
 async function main() {
   apply(ctx, {
@@ -55,32 +60,23 @@ async function main() {
     bind: '127.0.0.1',
     token: TOKEN,
     tokenFile: path.join(os.tmpdir(), 'dshremote-smoke.token'),
+    hostsFile: path.join(os.tmpdir(), 'dshremote-smoke.hosts'),
+    publicUrlFile: path.join(os.tmpdir(), 'dshremote-smoke.public'),
     logFile: path.join(os.tmpdir(), 'dshremote-smoke.log'),
+    proxyEnabled: false,
+    discovery: false,
+    tunnel: 'off',
   })
-  await sleep(600)
+  await sleep(700)
 
   // 1. /health
-  const health = await fetch(`http://127.0.0.1:${PORT}/health`).then((r) => r.json())
+  const health = JSON.parse((await request('/health')).body)
   check('health 返回 ok', health.ok === true && health.service === 'dshremote-bridge', JSON.stringify(health))
 
-  // 2. 错误 token 必须被拒
-  const bad = await openSocket()
-  bad.send(JSON.stringify({ type: 'auth', token: 'wrong', deviceName: 'test' }))
-  const errFrame = await nextFrame(bad).catch(() => null)
-  check('错误 token 被拒', errFrame?.type === 'error' && errFrame?.code === 'bad-token', JSON.stringify(errFrame))
-  bad.close()
-
-  // 3. 正确 token 通过，收到 hello
-  const good = await openSocket()
-  good.send(JSON.stringify({ type: 'auth', token: TOKEN, deviceName: 'HOP-AL10' }))
-  const hello = await nextFrame(good)
-  check('正确 token 收到 hello', hello.type === 'hello' && hello.protocol === 1, JSON.stringify(hello))
-
-  // 4. 模拟宿主事件：提问 → 回合结束
+  // 2. 事件总线：伪造宿主事件
   const onSessionEvent = handlers.get('session/event')
   check('注册了 session/event 处理器', typeof onSessionEvent === 'function')
 
-  const waiting = nextFrame(good, 3000)
   onSessionEvent(
     { id: 'session-abc' },
     { type: 'session/title', data: { title: '修构建问题' }, seq: 10 },
@@ -106,33 +102,47 @@ async function main() {
     { type: 'turn/end', data: { turn: 2, reason: { kind: 'natural' } }, seq: 13 },
   )
 
-  const frame = await waiting
-  check('收到 turn_end', frame.type === 'turn_end', JSON.stringify(frame))
-  check('turn_end 带会话标题', frame.sessionTitle === '修构建问题', frame.sessionTitle)
-  check('turn_end 带提问', frame.question.includes('00303024'), frame.question)
-  check('turn_end 带回复摘要', frame.answerHead.includes('modelVersion'), frame.answerHead)
-  check('turn_end 状态归一为 done', frame.status === 'done', frame.status)
-  check('turn_end 带 turn 序号', frame.turn === 2, String(frame.turn))
+  // 3. /events —— 回环免 token
+  const loopback = await request('/events')
+  check('/events 回环免 token', loopback.status === 200, String(loopback.status))
 
-  // 5. status 映射
-  check('reason=error → failed', (() => {
-    const onEvt = handlers.get('session/event')
-    return true
-  })())
+  // 4. /events —— 公网 Host 无 token 必须 401
+  const noToken = await request('/events', { host: PUBLIC_HOST })
+  check('/events 公网 Host 无 token → 401', noToken.status === 401, String(noToken.status))
 
-  // 6. /events 需要 token
-  const unauth = await fetch(`http://127.0.0.1:${PORT}/events`).then((r) => r.status)
-  check('/events 无 token 返回 401', unauth === 401, String(unauth))
-  const authed = await fetch(`http://127.0.0.1:${PORT}/events?token=${TOKEN}`).then((r) => r.json())
-  check('/events 带 token 返回事件', authed.ok === true && authed.events.length === 1, `${authed.events?.length} 条`)
+  // 5. /events —— 公网 Host 用请求头带 token
+  const viaHeader = await request('/events', { host: PUBLIC_HOST, 'x-dsh-token': TOKEN })
+  const body = JSON.parse(viaHeader.body)
+  const turnEnd = body.events.find((item) => item.type === 'turn_end')
+  check('/events 请求头带 token → 200', viaHeader.status === 200, String(viaHeader.status))
+  check('事件里带 turn_end', Boolean(turnEnd), `${body.events.length} 条`)
+  check('turn_end 带会话标题', turnEnd?.sessionTitle === '修构建问题', String(turnEnd?.sessionTitle))
+  check('turn_end 带提问', String(turnEnd?.question || '').includes('00303024'))
+  check('turn_end 带回复摘要', String(turnEnd?.answerHead || '').includes('modelVersion'))
+  check('turn_end 状态归一为 done', turnEnd?.status === 'done', String(turnEnd?.status))
+  check('turn_end 带 turn 序号', turnEnd?.turn === 2, String(turnEnd?.turn))
+  check('每个事件带单调 seq', body.events.every((item, i) => i === 0 || item.seq > body.events[i - 1].seq))
+  check('响应带 latestSeq', Number(body.latestSeq) >= Number(turnEnd?.seq), String(body.latestSeq))
 
-  // 7. /auth/url 需要 token（没有 connection 服务时应 503，而不是 500 崩掉）
-  const noAuthToken = await fetch(`http://127.0.0.1:${PORT}/auth/url`).then((r) => r.status)
-  check('/auth/url 无 token 返回 401', noAuthToken === 401, String(noAuthToken))
-  const noService = await fetch(`http://127.0.0.1:${PORT}/auth/url?token=${TOKEN}`).then((r) => r.status)
-  check('/auth/url 无 browserAuth 返回 503', noService === 503, String(noService))
+  // 6. afterSeq 增量拉取
+  const afterSeq = Number(turnEnd?.seq || 0)
+  const incremental = JSON.parse((await request(`/events?afterSeq=${afterSeq}`)).body)
+  check('afterSeq 过滤掉已读事件', incremental.events.every((item) => Number(item.seq) > afterSeq))
 
-  good.close()
+  // 7. 错误 token 被拒（公网 Host 下）
+  const wrong = await request(`/events?token=wrong`, { host: PUBLIC_HOST })
+  check('错误 token → 401', wrong.status === 401, String(wrong.status))
+
+  // 8. /auth/url：无 token 401；有 token 但没有 connection 服务 → 503
+  check('/auth/url 无 token → 401', (await request('/auth/url', { host: PUBLIC_HOST })).status === 401)
+  check('/auth/url 无 browserAuth → 503', (await request(`/auth/url?token=${TOKEN}`, { host: PUBLIC_HOST })).status === 503)
+
+  // 9. 非法 Host 不再崩进程
+  const badHost = await request('/', { host: 'bad host with spaces' })
+  check('非法 Host → 400 而不是崩溃', badHost.status === 400, String(badHost.status))
+  const stillAlive = JSON.parse((await request('/health')).body)
+  check('非法 Host 之后进程仍存活', stillAlive.ok === true)
+
   disposer?.()
   await sleep(200)
 
@@ -142,6 +152,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error('smoke 失败：', error)
+  console.error(error)
   process.exit(1)
 })

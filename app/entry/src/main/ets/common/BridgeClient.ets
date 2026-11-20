@@ -169,12 +169,49 @@ export class BridgeHttp {
       client.destroy();
     }
   }
+
+  /**
+   * 用二维码里的 60 秒一次性码换真正的 token。
+   * v2 起二维码不再携带长期口令，扫到的是 code，必须回来换一次。
+   */
+  static async claim(baseUrl: string, code: string): Promise<ClaimResult | null> {
+    const client = http.createHttp();
+    try {
+      const url = `${baseUrl}/pair/claim?code=${encodeURIComponent(code)}`;
+      const response = await client.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 5000,
+        readTimeout: 8000
+      });
+      if (response.responseCode !== 200) {
+        return null;
+      }
+      const body = JSON.parse(String(response.result)) as ClaimResult;
+      return body.ok && body.token.length >= 16 ? body : null;
+    } catch (error) {
+      return null;
+    } finally {
+      client.destroy();
+    }
+  }
+}
+
+/** /pair/claim 的返回：一次性码换出来的 token 与地址。 */
+export interface ClaimResult {
+  ok: boolean;
+  token: string;
+  base: string;
+  web: string;
+  lan: string;
+  tunnel: string;
+  proxyPort: number;
 }
 
 /** /events 的返回。 */
 interface EventsResult {
   ok: boolean;
   events: WireFrame[];
+  latestSeq: number;
 }
 
 /** 用 HTTP 轮询 /events 取 turn_end：鸿蒙 WebSocket 发不出帧，改用轮询兜底。 */
@@ -184,7 +221,8 @@ export class BridgePoller {
   private stopped: boolean = true;
   private baseUrl: string = '';
   private token: string = '';
-  private since: number = 0;
+  /** 用桥自己发的单调 seq 做游标：手机时钟和电脑对不齐也不影响。 */
+  private latestSeq: number = -1;
 
   onStatus: (text: string) => void = (text: string) => {
   };
@@ -195,8 +233,8 @@ export class BridgePoller {
     this.stop();
     this.baseUrl = baseUrl;
     this.token = token;
-    // 从此刻开始算，避免把桥里缓存的历史事件全部当新通知重放。
-    this.since = Date.now();
+    // -1 表示"还没对齐"，第一轮只拿 latestSeq 不弹通知，避免把历史事件全重放。
+    this.latestSeq = -1;
     this.stopped = false;
     this.onStatus('轮询已启动');
     this.tick();
@@ -212,33 +250,39 @@ export class BridgePoller {
     this.busy = true;
     const client = http.createHttp();
     try {
-      const url = `${this.baseUrl}/events?token=${encodeURIComponent(this.token)}&since=${this.since}`;
-      const response = await client.request(url, {
+      const query = this.latestSeq >= 0 ? `?afterSeq=${this.latestSeq}` : '';
+      const response = await client.request(`${this.baseUrl}/events${query}`, {
         method: http.RequestMethod.GET,
+        // token 走请求头，不再写进 URL（URL 会进日志、代理缓存与截图）。
+        header: { 'X-DSH-Token': this.token },
         connectTimeout: 5000,
         readTimeout: 8000
       });
       if (response.responseCode === 200) {
         const body = JSON.parse(String(response.result)) as EventsResult;
-        if (body.ok && body.events.length > 0) {
-          for (const frame of body.events) {
-            if (frame.ts > this.since) {
-              this.since = frame.ts;
-            }
-            if (frame.type !== 'turn_end') {
-              continue;
-            }
-            const event = new TurnEndEvent();
-            event.sessionId = frame.sessionId;
-            event.sessionTitle = frame.sessionTitle;
-            event.question = frame.question;
-            event.answerHead = frame.answerHead;
-            event.status = frame.status;
-            event.turn = frame.turn;
-            this.onTurnEnd(event);
-          }
+        const latest = Number(body.latestSeq ?? 0);
+        if (this.latestSeq < 0) {
+          this.latestSeq = Number.isFinite(latest) ? latest : 0;
           this.onStatus('轮询就绪');
+          return;
         }
+        for (const frame of body.events) {
+          if (frame.type !== 'turn_end') {
+            continue;
+          }
+          const event = new TurnEndEvent();
+          event.sessionId = frame.sessionId;
+          event.sessionTitle = frame.sessionTitle;
+          event.question = frame.question;
+          event.answerHead = frame.answerHead;
+          event.status = frame.status;
+          event.turn = frame.turn;
+          this.onTurnEnd(event);
+        }
+        if (Number.isFinite(latest) && latest > this.latestSeq) {
+          this.latestSeq = latest;
+        }
+        this.onStatus('轮询就绪');
       } else if (response.responseCode === 401) {
         this.onStatus('token 不对');
       }

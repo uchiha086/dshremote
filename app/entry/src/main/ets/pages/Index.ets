@@ -3,7 +3,7 @@ import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { webview } from '@kit.ArkWeb';
 import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
-import { BridgeHttp, BridgePoller, TurnEndEvent } from '../common/BridgeClient';
+import { BridgeHttp, BridgePoller, ClaimResult, TurnEndEvent } from '../common/BridgeClient';
 import { Discovery, FoundHost } from '../common/Discovery';
 import { Notifier } from '../common/Notifier';
 import { applyPairing, parsePairing, PairResult } from '../common/Pairing';
@@ -134,10 +134,24 @@ struct Index {
     const text = this.pairUri;
     this.pairUri = '';
     AppStorage.setOrCreate<string>('pairUri', '');
-    this.applyPairText(text);
+    // 外来的深链不能直接连：任何 App/网页都能发 dshremote://，先让用户看一眼是不是自己的电脑。
+    const preview: PairResult = parsePairing(text);
+    AlertDialog.show({
+      title: '收到配对请求',
+      message: preview.ok
+        ? `来自「${preview.name}」的配对链接，确认连接这台电脑吗？`
+        : `这个链接不是 DSH Remote 的配对码：${preview.error}`,
+      primaryButton: { value: '取消', action: () => { } },
+      secondaryButton: {
+        value: '连接',
+        action: () => {
+          this.applyPairText(text);
+        }
+      }
+    });
   }
 
-  private applyPairText(raw: string): void {
+  private async applyPairText(raw: string): Promise<void> {
     const result: PairResult = parsePairing(raw);
     if (!result.ok) {
       this.testResult = result.error;
@@ -146,6 +160,31 @@ struct Index {
     }
     const cfg = this.readForm();
     applyPairing(cfg, result);
+    // v2：二维码里只有 60 秒一次性码，先换真 token 才能连。
+    if (result.needsClaim) {
+      this.testResult = '正在用一次性码换取访问凭证…';
+      const lanBase = result.host.length > 0 ? `http://${result.host}:${result.port}` : '';
+      const candidates: string[] = lanBase.length > 0 ? [lanBase] : [];
+      if (result.tunnel.length > 0) {
+        candidates.push(result.tunnel);
+      }
+      let claimed: ClaimResult | null = null;
+      for (const candidateBase of candidates) {
+        claimed = await BridgeHttp.claim(candidateBase, result.code);
+        if (claimed !== null) {
+          break;
+        }
+      }
+      if (claimed === null) {
+        this.testResult = '配对码已失效（一次性码 60 秒过期），请回电脑刷新二维码';
+        this.stage = 'scan';
+        return;
+      }
+      cfg.token = claimed.token;
+      if (claimed.tunnel.length > 0) {
+        cfg.tunnel = claimed.tunnel;
+      }
+    }
     this.cfg = cfg;
     this.hostInput = cfg.host;
     this.portInput = `${cfg.port}`;
@@ -465,7 +504,7 @@ struct Index {
       }
       .layoutWeight(1)
 
-      Text('v0.2.0 · 电脑端需要 dshremote-bridge 插件')
+      Text('v0.2.1 · 电脑端需要 dshremote-bridge 插件')
         .fontSize(11)
         .fontColor('#9CA3AF')
         .margin({ bottom: 18 })

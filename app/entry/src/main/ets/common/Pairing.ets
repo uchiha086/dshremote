@@ -10,6 +10,10 @@ export class PairResult {
   proxyPort: number = 7627;
   tunnel: string = '';
   token: string = '';
+  /** v2 起二维码里是 60 秒一次性配对码，要拿它去 /pair/claim 换 token。 */
+  code: string = '';
+  /** 是否还需要扫码后到电脑上换 token。 */
+  needsClaim: boolean = false;
 }
 
 class ParsedHttp {
@@ -42,7 +46,8 @@ function parseHttp(value: string): ParsedHttp {
 
 /**
  * 解析电脑上生成的配对链接：
- * dshremote://pair?v=1&name=<电脑名>&base=<地址>&web=<网页地址>&token=<口令>
+ * v2: dshremote://pair?v=2&name=<电脑名>&base=<局域网>&web=<网页>&tunnel=<公网>&code=<一次性码>
+ * v1（旧版，仅兼容）：…&token=<口令>
  */
 export function parsePairing(raw: string): PairResult {
   const out = new PairResult();
@@ -61,18 +66,31 @@ export function parsePairing(raw: string): PairResult {
     if (eq < 0) {
       continue;
     }
-    fields.set(pair.substring(0, eq), decodeURIComponent(pair.substring(eq + 1)));
+    // 二维码里的百分号编码可能不完整（手输、复制截断），解码失败就按原文用。
+    const value = pair.substring(eq + 1);
+    let decoded = value;
+    try {
+      decoded = decodeURIComponent(value);
+    } catch (error) {
+      decoded = value;
+    }
+    fields.set(pair.substring(0, eq), decoded);
   }
   const base = fields.get('base') ?? '';
   const web = fields.get('web') ?? base;
   const tunnel = fields.get('tunnel') ?? '';
   const token = fields.get('token') ?? '';
-  if (token.length < 16) {
-    out.error = '配对码里没有有效的 token';
+  const code = fields.get('code') ?? '';
+  out.name = fields.get('name') ?? '电脑';
+  if (token.length >= 16) {
+    out.token = token;
+  } else if (code.length >= 8) {
+    out.code = code;
+    out.needsClaim = true;
+  } else {
+    out.error = '配对码里没有有效的口令或一次性码';
     return out;
   }
-  out.token = token;
-  out.name = fields.get('name') ?? '电脑';
   // 先解析局域网地址（可能没有，比如只有隧道时）
   if (base.startsWith('https://')) {
     out.tunnel = base.replace(/\/+$/, '');
@@ -109,3 +127,4 @@ export function applyPairing(cfg: BridgeConfig, result: PairResult): void {
   // 两个地址都有时先试局域网；只有隧道就直接走公网。
   cfg.preferTunnel = result.host.length === 0 && result.tunnel.length > 0;
 }
+

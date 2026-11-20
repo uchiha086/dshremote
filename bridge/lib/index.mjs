@@ -9,22 +9,33 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { svgOf } from './qr.mjs'
-import { createWebSocketServer } from './websocket.mjs'
 
 /** 桥插件版本，手机端据此判断兼容性。 */
-const BRIDGE_VERSION = '0.2.0'
+const BRIDGE_VERSION = '0.2.1'
 
-/** WebSocket 子协议标识，握手时就固定，避免手机连到别的服务上。 */
-const WS_PROTOCOL = 'dshremote-bridge-v1'
-
-/** 鉴权超时：连上后必须在这段时间内发 auth 帧，否则断开。 */
-const AUTH_TIMEOUT_MS = 10_000
-
-/** 心跳间隔。 */
-const HEARTBEAT_MS = 30_000
 
 /** 最近事件最多留多少条，供 /events 调试与手机补拉。 */
-const EVENT_BUFFER = 100
+const EVENT_BUFFER = 1000
+
+/** 一次性配对码：扫码后用它换 token，二维码里不再塞长期口令。 */
+const PAIR_CODE_TTL_MS = 60_000
+
+/** 本机回环地址集合：来自这些地址的请求才算"本机进程"。 */
+const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+
+/** 允许跨源访问桥的页面来源（DSH 桌面端是 dsh-app://app，Web 版是 127.0.0.1:端口）。 */
+function isAllowedOrigin(origin) {
+  const value = String(origin ?? '').trim()
+  if (!value) return true
+  if (value === 'dsh-app://app' || value === 'dsh-app://-') return true
+  try {
+    const parsed = new URL(value)
+    if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') return true
+  } catch {
+    return false
+  }
+  return false
+}
 
 const DEFAULT_OPTIONS = {
   enabled: true,
@@ -44,8 +55,10 @@ const DEFAULT_OPTIONS = {
   // 当前对外的公网地址（Cloudflare 隧道域名等）；隧道地址会变，所以既能写配置也能运行时通过 /public 存入文件。
   publicUrl: '',
   publicUrlFile: '',
-  // 局域网自动发现：往 3089 端口广播自己，手机 App 监听即可自动列出电脑，不用手填 IP。
-  discovery: true,
+  // 局域网自动发现：默认关闭。早先默认开启且广播里带 token，
+  // 等于把口令明文撒到同网段（咖啡厅/酒店/校园网都不安全）。
+  // 需要时在配置里打开 discovery: true，beacon 也只会广播身份与地址，不带 token。
+  discovery: false,
   discoveryPort: 3089,
   // 隧道：auto = 由桥自己拉起 cloudflared 快速隧道并守护重启，off = 手动跑 tools/tunnel.ps1。
   tunnel: 'off',
@@ -54,11 +67,11 @@ const DEFAULT_OPTIONS = {
   tunnelWaitMs: 60_000,
 }
 
-/** 读已保存的 token；只认长十六进制串，避免把脏内容当口令用。 */
+/** 读已保存的 token；太短或含空白的都不认，避免把脏内容当口令用。 */
 function readToken(file) {
   try {
     const text = fs.readFileSync(file, 'utf8').trim()
-    return /^[a-f0-9]{16,128}$/i.test(text) ? text : ''
+    return /^[A-Za-z0-9._~-]{16,128}$/.test(text) ? text : ''
   } catch {
     return ''
   }
@@ -274,6 +287,112 @@ export function apply(ctx, config) {
     return true
   }
 
+  /** 请求是不是本机进程发起的（回环地址）。隧道流量在本地看也是 127.0.0.1，所以还要结合 Host 判断。 */
+  function remoteIsLoopback(request) {
+    if (!LOOPBACK_ADDRESSES.has(String(request.socket?.remoteAddress ?? ''))) return false
+    // Host 头也必须指着回环：否则就是"本机进程伪装成隧道域名"，不能当本地面板用。
+    const host = String(request.headers.host ?? '').replace(/^\[/, '').replace(/\](:\d+)?$/, '').replace(/:\d+$/, '').toLowerCase()
+    return LOOPBACK_ADDRESSES.has(host) || host === 'localhost'
+  }
+
+  /** 取请求里的 token：优先 Authorization: Bearer，其次 X-DSH-Token，最后兼容旧的 ?token=。 */
+  function tokenFrom(request, url) {
+    const auth = String(request.headers['authorization'] ?? '')
+    if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, "").trim()
+    const header = String(request.headers['x-dsh-token'] ?? '').trim()
+    if (header) return header
+    return String(url.searchParams.get('token') ?? '').trim()
+  }
+
+  function sameToken(value) {
+    const given = Buffer.from(String(value ?? ''), 'utf8')
+    const expected = Buffer.from(String(token ?? ''), 'utf8')
+    if (given.length !== expected.length) return false
+    return crypto.timingSafeEqual(given, expected)
+  }
+
+  /** 需要鉴权：来自非回环地址，或 Host 是公网域名（隧道场景）。 */
+  function needsAuth(request, host) {
+    return !remoteIsLoopback(request) || looksPublic(host)
+  }
+
+  function deny(response, status = 401, error = 'bad-token') {
+    response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    response.end(JSON.stringify({ ok: false, error }))
+  }
+
+  /** 读接口的鉴权：回环 + 局域网 Host 放行，其余必须带 token。 */
+  function allowToken(request, response, url, host) {
+    if (!needsAuth(request, host)) return true
+    if (sameToken(tokenFrom(request, url))) return true
+    deny(response)
+    return false
+  }
+
+  /** 状态变更接口（/repair、/ai-fix 等）只认请求头里的 token，并校验 Origin，防 CSRF。 */
+  function allowHeaderToken(request, response) {
+    const auth = String(request.headers['authorization'] ?? '')
+    const bearer = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, '').trim() : ''
+    const provided = String(request.headers['x-dsh-token'] ?? '').trim() || bearer
+    if (!provided) {
+      deny(response)
+      return false
+    }
+    if (!sameToken(provided)) {
+      deny(response)
+      return false
+    }
+    if (!isAllowedOrigin(request.headers.origin)) {
+      deny(response, 403, 'bad-origin')
+      return false
+    }
+    return true
+  }
+
+  /** 简单令牌桶：按来源地址限速，避免 /pair/test、/repair 被刷成打手。 */
+  const rateBuckets = new Map()
+  function rateLimit(request, key, capacity, refillPerSecond) {
+    const id = `${key}:${request.socket?.remoteAddress ?? 'unknown'}`
+    const now = Date.now()
+    const bucket = rateBuckets.get(id) ?? { tokens: capacity, updatedAt: now }
+    bucket.tokens = Math.min(capacity, bucket.tokens + ((now - bucket.updatedAt) / 1000) * refillPerSecond)
+    bucket.updatedAt = now
+    const allowed = bucket.tokens >= 1
+    if (allowed) bucket.tokens -= 1
+    rateBuckets.set(id, bucket)
+    if (rateBuckets.size > 500) {
+      const oldest = rateBuckets.keys().next().value
+      rateBuckets.delete(oldest)
+    }
+    return allowed
+  }
+
+  /** 一次性配对码：内存里存 60 秒，单次有效，手机拿它换长期 token。 */
+  const pairCodes = new Map()
+  function prunePairCodes() {
+    const now = Date.now()
+    for (const [code, entry] of pairCodes) {
+      if (entry.expiresAt <= now) pairCodes.delete(code)
+    }
+  }
+  function issuePairCode() {
+    prunePairCodes()
+    const code = crypto.randomBytes(9).toString('base64url')
+    pairCodes.set(code, { expiresAt: Date.now() + PAIR_CODE_TTL_MS, used: false })
+    if (pairCodes.size > 200) {
+      const oldest = pairCodes.keys().next().value
+      pairCodes.delete(oldest)
+    }
+    return code
+  }
+  function claimPairCode(code) {
+    prunePairCodes()
+    const entry = pairCodes.get(String(code ?? '').trim())
+    if (!entry || entry.used || entry.expiresAt <= Date.now()) return null
+    entry.used = true
+    return entry
+  }
+
   /**
    * 生成配对信息：局域网地址 + 公网地址都给，二维码里编码"当下最该用的那个"。
    * 手机扫到后写入配置，就不用再手抄 IP 和 token。
@@ -290,15 +409,18 @@ export function apply(ctx, config) {
     const target = choosePublic ? pub : lan
     // 二维码里同时带局域网与公网：手机在同一个 Wi-Fi 就直连，出了门自动改走隧道。
     // 只编码一个地址的话，换个网络就得重新扫码。
+    // v2 起二维码里不再带长期 token，改带 60 秒一次性 pairCode：
+    // 截图/投屏/肩窥泄露的只是一个马上作废的码，换不成登录态。
+    const code = issuePairCode()
     const payload = [
-      'dshremote://pair?v=1',
+      'dshremote://pair?v=2',
       `&name=${encodeURIComponent(os.hostname())}`,
       `&base=${encodeURIComponent(lan.base)}`,
       `&web=${encodeURIComponent(lan.web)}`,
       pub ? `&tunnel=${encodeURIComponent(pub.base)}` : '',
-      `&token=${token}`,
+      `&code=${code}`
     ].join('')
-    return { name: os.hostname(), lan, lanAll, public: pub, target, payload }
+    return { name: os.hostname(), lan, lanAll, public: pub, target, payload, code }
   }
 
   // 本机 DNS 对 Cloudflare 域名会抖（NXDOMAIN / i/o timeout），而 *.trycloudflare.com 的解析结果
@@ -418,13 +540,15 @@ export function apply(ctx, config) {
   }
 
   /** 手机扫码/自动发现后要能连上，这里统一给一份 JSON。 */
-  function pairingJson(hostHeader) {
+  function pairingJson(hostHeader, { includeToken = false } = {}) {
     const info = pairing(hostHeader)
     return {
       ok: true,
-      v: 1,
+      v: 2,
       name: info.name,
       payload: info.payload,
+      code: info.code,
+      codeTtlMs: PAIR_CODE_TTL_MS,
       base: info.target.base,
       web: info.target.web,
       lan: info.lan,
@@ -433,6 +557,8 @@ export function apply(ctx, config) {
       tunnel: info.public ? info.public.base : '',
       tunnelPending: Boolean(publicUrl) && !tunnelFresh(),
       proxyPort: options.proxyPort,
+      // 只有本机进程（桌面面板）才拿得到长期 token，用来调 /repair、/ai-fix 这类状态变更接口。
+      ...(includeToken ? { token } : {}),
     }
   }
 
@@ -493,11 +619,16 @@ export function apply(ctx, config) {
   const sessions = new Map()
   const clients = new Set()
   const events = []
+  // 单调递增的事件序号：客户端只记 seq，不依赖手机与服务端的时钟一致。
+  let eventSeq = 0
   const startedAt = Date.now()
 
   function pushEvent(frame) {
-    events.push(frame)
+    eventSeq += 1
+    const stamped = { ...frame, seq: eventSeq }
+    events.push(stamped)
     if (events.length > EVENT_BUFFER) events.shift()
+    return stamped
   }
 
   function broadcast(frame) {
@@ -677,18 +808,48 @@ export function apply(ctx, config) {
   }
 
   const handleBridgeRequest = (request, response) => {
-    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+    let url
+    try {
+      const hostHeader = String(request.headers.host ?? '')
+      // Host 头是攻击者可控的：非法 authority 会让 new URL 抛异常，
+      // 而这里在请求处理链最外层，异常没人接就会打崩整个 DSH 宿主进程。
+      if (!hostHeader || /\s/.test(hostHeader)) throw new Error('bad-host')
+      url = new URL(request.url ?? '/', `http://${hostHeader}`)
+    } catch {
+      response.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+      response.end(JSON.stringify({ ok: false, error: 'bad-request-url' }))
+      return
+    }
+    const requestHost = String(request.headers.host ?? '')
 
-    // 桌面端页面跑在 dsh-app://app 这类自定义协议下，请求桥属于跨源；
-    // 统一的 CORS 预检与响应头放在最前面，省得每个路由各写一遍。
+    response.setHeader('x-content-type-options', 'nosniff')
+    response.setHeader('referrer-policy', 'no-referrer')
+
+    // 桌面端页面跑在 dsh-app://app 这类自定义协议下，请求桥属于跨源。
+    // 只对白名单来源回 CORS——用 * 等于把接口开给任意网页。
+    const requestOrigin = String(request.headers.origin ?? '')
+    if (requestOrigin && isAllowedOrigin(requestOrigin)) {
+      response.setHeader('access-control-allow-origin', requestOrigin)
+      response.setHeader('vary', 'origin')
+      response.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS')
+      response.setHeader('access-control-allow-headers', 'content-type, x-dsh-token, authorization')
+      response.setHeader('access-control-max-age', '600')
+    }
+
     if (request.method === 'OPTIONS') {
-      response.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'content-type',
-        'access-control-max-age': '600',
-      })
+      if (requestOrigin && !isAllowedOrigin(requestOrigin)) {
+        deny(response, 403, 'bad-origin')
+        return
+      }
+      response.writeHead(204)
       response.end()
+      return
+    }
+
+    // 敏感接口统一限速：体检/修复/出码/换码都是重操作，也是被打的主要目标。
+    const SENSITIVE_PATHS = new Set(['/pair', '/pair.svg', '/pair.png', '/pair.html', '/pair/test', '/pair/claim', '/repair', '/ai-fix'])
+    if (SENSITIVE_PATHS.has(url.pathname) && !rateLimit(request, 'sensitive', 40, 0.5)) {
+      deny(response, 429, 'rate-limited')
       return
     }
 
@@ -709,11 +870,7 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/auth/url') {
-      if (url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       if (!browserAuth?.authenticatedUrl) {
         response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
         response.end(JSON.stringify({ ok: false, error: 'browser-auth-unavailable' }))
@@ -735,11 +892,7 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/auth/cookie') {
-      if (url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       if (!browserAuth?.authenticatedUrl) {
         response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
         response.end(JSON.stringify({ ok: false, error: 'browser-auth-unavailable' }))
@@ -774,25 +927,23 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/events') {
-      if (url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
-      // since=<ts> 只回比它更新的事件，手机轮询时用它去重，避免每轮重发旧通知。
+      if (!allowToken(request, response, url, requestHost)) return
+      // 游标优先用服务端自增的 seq（手机时钟不可信），旧的 since=<ts> 仍兼容。
+      const afterSeq = Number(url.searchParams.get('afterSeq') ?? '')
       const since = Number(url.searchParams.get('since') ?? '')
-      const list = Number.isFinite(since) && since > 0 ? events.filter((frame) => Number(frame.ts) > since) : events
-      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
-      response.end(JSON.stringify({ ok: true, events: list }))
+      let list = events
+      if (Number.isFinite(afterSeq) && afterSeq >= 0 && url.searchParams.has('afterSeq')) {
+        list = events.filter((frame) => Number(frame.seq ?? 0) > afterSeq)
+      } else if (Number.isFinite(since) && since > 0) {
+        list = events.filter((frame) => Number(frame.ts) > since)
+      }
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify({ ok: true, events: list, latestSeq: eventSeq }))
       return
     }
 
     if (url.pathname === '/trust') {
-      if (url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       const host = String(url.searchParams.get('host') ?? '').trim()
       if (!host) {
         response.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
@@ -808,36 +959,54 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/pair') {
-      // 本地（回环/局域网）扫码本来就该拿到 token；从公网转发进来则要求带上 token，避免把口令送到隧道里。
-      const host = String(request.headers.host ?? '')
-      if (looksPublic(host) && url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      // 面板（本机进程）取配对信息；公网进来的必须带 token，避免把口令送进隧道。
+      if (!allowToken(request, response, url, requestHost)) return
+      const includeToken = remoteIsLoopback(request) && !looksPublic(requestHost)
       response.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
         'cache-control': 'no-store',
-        // Web UI 走 7627（反代端口）时与桥不同源，配对面板要能跨源取数据。
-        'access-control-allow-origin': '*',
       })
-      response.end(JSON.stringify(pairingJson(host)))
+      response.end(JSON.stringify(pairingJson(requestHost, { includeToken })))
+      return
+    }
+
+    // 一次性配对码换长期凭证：二维码里只有 60 秒有效、单次使用的 code。
+    if (url.pathname === '/pair/claim') {
+      const code = String(url.searchParams.get('code') ?? request.headers['x-pair-code'] ?? '').trim()
+      if (!rateLimit(request, 'claim', 10, 0.2)) {
+        deny(response, 429, 'rate-limited')
+        return
+      }
+      const entry = claimPairCode(code)
+      if (!entry) {
+        deny(response, 401, 'bad-pair-code')
+        return
+      }
+      const info = pairing(requestHost)
+      log(`配对码已兑换 peer=${request.socket?.remoteAddress ?? '?'}`)
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify({
+        ok: true,
+        v: 2,
+        name: info.name,
+        token,
+        base: info.lan.base,
+        web: info.lan.web,
+        lan: info.lan,
+        lanAll: info.lanAll,
+        tunnel: info.public ? info.public.base : '',
+        proxyPort: options.proxyPort,
+      }))
       return
     }
 
     if (url.pathname === '/pair/test') {
       // 面板在生成二维码之前先跑一遍体检：局域网 / 反代 / 隧道三段都通了才出码。
-      const host = String(request.headers.host ?? '')
-      if (looksPublic(host) && url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       pairTest().then((result) => {
         response.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
-          'access-control-allow-origin': '*',
         })
         response.end(JSON.stringify(result))
       }).catch((error) => {
@@ -848,18 +1017,12 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/pair.svg' || url.pathname === '/pair.png') {
-      const host = String(request.headers.host ?? '')
-      if (looksPublic(host) && url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       try {
-        const svg = svgOf(pairing(host).payload, { scale: 8, margin: 4 })
+        const svg = svgOf(pairing(requestHost).payload, { scale: 8, margin: 4 })
         response.writeHead(200, {
           'content-type': 'image/svg+xml; charset=utf-8',
           'cache-control': 'no-store',
-          'access-control-allow-origin': '*',
         })
         response.end(svg)
       } catch (error) {
@@ -871,10 +1034,9 @@ export function apply(ctx, config) {
     }
 
     if (url.pathname === '/pair.html') {
-      const host = String(request.headers.host ?? '')
-      const info = pairing(host)
-      const tokenParam = url.searchParams.get('token')
-      const suffix = tokenParam ? `?token=${encodeURIComponent(tokenParam)}` : ''
+      // 这页会把配对链接（含一次性 code）整段打出来，只给本机看。
+      if (!allowToken(request, response, url, requestHost)) return
+      const info = pairing(requestHost)
       const publicNote = info.public ? `公网地址：${info.public.base}` : '公网地址：未设置（只在局域网内可扫）'
       const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>DSH Remote 配对</title>
@@ -885,8 +1047,8 @@ h1{font-size:20px;margin:0 0 6px}p{margin:4px 0;font-size:13px;color:#9fb0d0}
 code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-radius:8px;display:block;max-width:520px}
 </style></head><body>
 <h1>用手机 App 扫这个码</h1>
-<p>App 首页 →「扫一扫」→ 对准屏幕。扫完会自动填好地址与 token。</p>
-<div class="card"><img src="/pair.svg${suffix}" width="280" height="280" alt="pairing qr"/></div>
+<p>App 首页 →「扫一扫」→ 对准屏幕。二维码里只有 60 秒有效的一次性配对码，扫完自动换成设备凭证。</p>
+<div class="card"><img src="/pair.svg" width="280" height="280" alt="pairing qr"/></div>
 <p>${publicNote}</p>
 <code>${info.payload}</code>
 </body></html>`
@@ -896,11 +1058,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     }
 
     if (url.pathname === '/public') {
-      if (url.searchParams.get('token') !== token) {
-        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
-        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
-        return
-      }
+      if (!allowToken(request, response, url, requestHost)) return
       const value = String(url.searchParams.get('url') ?? '').trim()
       if (value) {
         if (!/^https?:\/\/[^\s/]+/i.test(value)) {
@@ -908,20 +1066,32 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           response.end(JSON.stringify({ ok: false, error: 'bad-url' }))
           return
         }
-        publicUrl = value.replace(/\/+$/, '')
-        writePublicUrl(publicUrl)
-        // 调用方（tools/tunnel.ps1）发布前已经打通过 /health，这里直接记为已校验。
-        tunnelVerifiedAt = Date.now()
-        trustHost(tunnelAuthority(publicUrl))
-        log(`公网地址=${publicUrl}`)
+        const candidate = value.replace(/\/+$/, '')
+        // 不采信调用方的自报：自己回打公网 /health，返回 200 且服务名对得上才算"已验证"。
+        verifyTunnel(candidate, tunnelAuthority(candidate)).then((ok) => {
+          if (ok) {
+            publicUrl = candidate
+            writePublicUrl(publicUrl)
+            tunnelVerifiedAt = Date.now()
+            trustHost(tunnelAuthority(candidate))
+            log(`公网地址=${publicUrl}（已回打校验）`)
+          } else {
+            log(`公网地址校验失败，不写进二维码：${candidate}`)
+          }
+          response.writeHead(ok ? 200 : 502, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(JSON.stringify({ ok: Boolean(ok), public: publicUrl || null, verified: Boolean(ok) }))
+        })
+        return
       }
       response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-      response.end(JSON.stringify({ ok: true, public: publicUrl || null }))
+      response.end(JSON.stringify({ ok: true, public: publicUrl || null, verified: tunnelFresh() }))
       return
     }
 
     // 一键修复：把卡住的隧道进程换掉，等到一条真的能被公网访问的地址再返回。
     if (url.pathname === '/repair') {
+      // 会杀进程、清公网地址：必须是带 token 的请求，不能被人用 <img> 之类触发。
+      if (!allowHeaderToken(request, response)) return
       const startedRepair = Date.now()
       void (async () => {
         const reply = (status, body) => {
@@ -988,6 +1158,16 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
 
     // 让 AI 修：在当前 DSH 里开一个新会话，把体检结果和修复要点直接发给它。
     if (url.pathname === '/ai-fix') {
+      // 这是"让 agent 在电脑上跑命令改文件"的动作，只允许本机进程 + 带 token 的请求。
+      if (!allowHeaderToken(request, response)) return
+      if (!remoteIsLoopback(request)) {
+        deny(response, 403, 'loopback-only')
+        return
+      }
+      if (!rateLimit(request, 'ai-fix', 3, 0.02)) {
+        deny(response, 429, 'rate-limited')
+        return
+      }
       void (async () => {
         const reply = (status, body) => {
           response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -1061,92 +1241,11 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     log(`同源路由已挂载 ${sameOriginDisposers.length} 条（${SAME_ORIGIN_PREFIX}/*）`)
   }
 
-  const wss = createWebSocketServer(server, { path: '/ws', protocol: WS_PROTOCOL, fallback: proxyUpgrade })
-
-  wss.on('connection', (ws, request) => {
-    const client = {
-      ws,
-      authed: false,
-      deviceName: 'unknown',
-      peer: request.socket.remoteAddress ?? 'unknown',
-      connectedAt: Date.now(),
-    }
-    clients.add(client)
-    log(`WS 连接 ${client.peer}`)
-
-    const authTimer = setTimeout(() => {
-      if (!client.authed) {
-        log(`鉴权超时，断开 ${client.peer}`)
-        ws.close(4001, 'auth-timeout')
-      }
-    }, AUTH_TIMEOUT_MS)
-
-    ws.on('message', (raw) => {
-      let frame
-      try {
-        frame = JSON.parse(String(raw))
-      } catch {
-        return
-      }
-      if (!frame || typeof frame !== 'object') return
-
-      if (frame.type === 'auth') {
-        const provided = typeof frame.token === 'string' ? frame.token : ''
-        const a = Buffer.from(provided)
-        const b = Buffer.from(token)
-        const same = a.length === b.length && crypto.timingSafeEqual(a, b)
-        if (!same) {
-          log(`鉴权失败 ${client.peer}`)
-          ws.send(JSON.stringify({ type: 'error', code: 'bad-token' }))
-          ws.close(4003, 'bad-token')
-          return
-        }
-        client.authed = true
-        client.deviceName = typeof frame.deviceName === 'string' ? frame.deviceName.slice(0, 64) : 'unknown'
-        clearTimeout(authTimer)
-        ws.send(JSON.stringify({
-          type: 'hello',
-          protocol: 1,
-          bridgeVersion: BRIDGE_VERSION,
-          host: os.hostname(),
-          now: Date.now(),
-          proxyPort: options.proxyEnabled ? options.proxyPort : null,
-        }))
-        log(`鉴权通过 device=${client.deviceName} peer=${client.peer}`)
-        return
-      }
-
-      if (!client.authed) {
-        ws.send(JSON.stringify({ type: 'error', code: 'not-authenticated' }))
-        return
-      }
-
-      if (frame.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
-      }
-      // ack 目前只记日志，留给后续推送可靠性用。
-      if (frame.type === 'ack') {
-        log(`收到 ack id=${frame.id ?? ''}`)
-      }
-    })
-
-    ws.on('close', () => {
-      clearTimeout(authTimer)
-      clients.delete(client)
-      log(`WS 断开 ${client.peer} device=${client.deviceName}`)
-    })
-
-    ws.on('error', (error) => {
-      log(`WS 错误 ${client.peer}: ${error?.message ?? error}`)
-    })
+  // 两个客户端都走 HTTP 轮询，桥不再自己实现 WebSocket 服务端（手写 RFC6455 的攻击面不值当）。
+  // 升级请求一律按老行为反代给 DSH。
+  server.on('upgrade', (request, socket, head) => {
+    proxyUpgrade(request, socket, head)
   })
-
-  const heartbeat = setInterval(() => {
-    for (const client of clients) {
-      if (client.ws.closed) continue
-      client.ws.ping()
-    }
-  }, HEARTBEAT_MS)
 
   // DSH Web 只监听回环，手机访问不到；这里做一层裸 TCP 反代。
   let proxy = null
@@ -1215,7 +1314,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           proxy: options.proxyEnabled ? options.proxyPort : null,
           lan: lanAddresses(),
           public: publicUrl || null,
-          token,
+          // 广播只用来"发现电脑在哪"，故意不带 token：同网段任何设备都能收到这包，
+          // 带口令等于把登录凭据撒出去。配对仍然要扫二维码或手动填 token。
         }), 'utf8')
         socket.send(body, 0, body.length, options.discoveryPort, '255.255.255.255', () => {
           // 广播发不出去（比如没有网卡）不影响其它功能。
@@ -1379,8 +1479,18 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
 
   /** 从本机经隧道打一次 /health，确认这条隧道真的能用。 */
   function verifyTunnel(base, authority) {
+    const parsed = (() => {
+      try {
+        return new URL(base)
+      } catch {
+        return null
+      }
+    })()
+    const secure = !parsed || parsed.protocol === 'https:'
     const host = String(authority ?? '').replace(/:\d+$/, '')
-    const tunnelHost = isTunnelHost(host)
+    const tunnelHost = secure && isTunnelHost(host)
+    const port = secure ? 443 : Number(parsed?.port || 80)
+    const agent = secure ? https : http
     const attempt = (force) => new Promise((resolve) => {
       let settled = false
       const done = (ok) => {
@@ -1389,9 +1499,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         resolve(ok)
       }
       try {
-        const request = https.request({
-          host: authority,
-          port: 443,
+        const request = agent.request({
+          hostname: host,
+          port,
           path: '/health',
           method: 'GET',
           timeout: 8000,
@@ -1511,7 +1621,6 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     })()
 
     return () => {
-      clearInterval(heartbeat)
       clearInterval(beaconTimer)
       for (const dispose of sameOriginDisposers) {
         try {
@@ -1549,8 +1658,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         client.ws.close(1001, 'shutdown')
       }
       clients.clear()
-      wss.removeAllListeners()
-      server.close()
+        server.close()
       proxy?.close()
       log('已停止')
     }

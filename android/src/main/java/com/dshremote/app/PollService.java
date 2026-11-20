@@ -42,23 +42,37 @@ public class PollService extends Service {
     }
 
     private void loop() {
-        long since = System.currentTimeMillis();
+        // 用桥侧的单调 seq 做游标；第一次调用传 -1 只对齐游标，不补发历史通知。
+        long latestSeq = -1;
         while (running) {
             try {
                 Store cfg = Store.load(this);
                 if (cfg.valid()) {
-                    JSONArray events = Http.events(cfg.base(), cfg.token, since);
-                    for (int i = 0; i < events.length(); i++) {
-                        JSONObject ev = events.optJSONObject(i);
-                        if (ev == null) continue;
-                        long ts = ev.optLong("ts", 0);
-                        if (ts > since) since = ts;
-                        if (!"turn_end".equals(ev.optString("type"))) continue;
-                        String title = ev.optString("title", "DSH");
-                        String status = ev.optString("status", "done");
-                        String head = ev.optString("head", "");
-                        notifyTurn(this, title + " · " + status, head);
+                    Http.Events batch = Http.events(cfg.base(), cfg.token, latestSeq);
+                    if (batch.latestSeq < 0) {
+                        // 连不上：保持游标不动，等下一轮。
+                        Thread.sleep(5000);
+                        continue;
                     }
+                    if (latestSeq < 0) {
+                        latestSeq = batch.latestSeq;
+                        Thread.sleep(3000);
+                        continue;
+                    }
+                    for (int i = 0; i < batch.list.length(); i++) {
+                        JSONObject ev = batch.list.optJSONObject(i);
+                        if (ev == null) continue;
+                        if (!"turn_end".equals(ev.optString("type"))) continue;
+                        // 字段名必须和桥实际发的一致（sessionTitle / answerHead / question），
+                        // 之前读 title/head 导致通知只有标题没有正文。
+                        String title = ev.optString("sessionTitle", "DSH");
+                        String status = ev.optString("status", "done");
+                        String head = ev.optString("answerHead", "");
+                        String question = ev.optString("question", "");
+                        String body = head.isEmpty() ? question : head;
+                        notifyTurn(this, title + " · " + status, body);
+                    }
+                    latestSeq = batch.latestSeq;
                 }
                 Thread.sleep(3000);
             } catch (InterruptedException e) {

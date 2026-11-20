@@ -81,12 +81,12 @@ const trust = await get(BRIDGE_PORT, '/trust?token=testtoken0123456789&host=DEMO
 assert.equal(trust.status, 200)
 assert.ok(trustedHosts.includes('demo.trycloudflare.com'), 'trustedHosts 应该多了小写化后的域名')
 
-// 4) /trust 也要 token
-const badTrust = await get(BRIDGE_PORT, '/trust?token=nope&host=evil.example.com')
+// 4) /trust 也要 token（回环 + 回环 Host 属于"本地面板"，必须换成公网 Host 才能测鉴权）
+const badTrust = await get(BRIDGE_PORT, '/trust?token=nope&host=evil.example.com', 'demo.trycloudflare.com')
 assert.equal(badTrust.status, 401)
 
-// 5) 未登录的 /events 仍然 401
-const events = await get(BRIDGE_PORT, '/events')
+// 5) 未登录的 /events 仍然 401（同样用公网 Host）
+const events = await get(BRIDGE_PORT, '/events', 'demo.trycloudflare.com')
 assert.equal(events.status, 401)
 
 // 6) WebSocket 升级（非 /ws）应被透传：桩服务不认 upgrade，会回 200，这里只验证连接没被直接掐断
