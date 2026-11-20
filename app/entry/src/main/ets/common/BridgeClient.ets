@@ -101,10 +101,10 @@ export class BridgeHttp {
   }
 
   /** 向桥要一份可以直接写进 WebView 的登录 cookie。 */
-  static async authCookie(baseUrl: string, token: string): Promise<string> {
+  static async authCookie(baseUrl: string, token: string, targetBase: string): Promise<string> {
     const client = http.createHttp();
     try {
-      const url = `${baseUrl}/auth/cookie?token=${encodeURIComponent(token)}`;
+      const url = `${baseUrl}/auth/cookie?token=${encodeURIComponent(token)}&base=${encodeURIComponent(targetBase)}`;
       const response = await client.request(url, {
         method: http.RequestMethod.GET,
         connectTimeout: 5000,

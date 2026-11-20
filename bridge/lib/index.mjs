@@ -208,8 +208,10 @@ export function apply(ctx, config) {
   const disposeEvents = ctx.on('session/event', onSessionEvent)
   const disposeStatus = ctx.on('api-session/status', onSessionStatus)
 
-  /** 顺着带 tokened 的地址打一次上游，把 Set-Cookie 取回来（手机端自己设 cookie，绕开 WebView 的 SameSite 策略）。 */
-  function fetchAuthCookie(authedUrl) {
+  /** 顺着带 tokened 的地址打一次上游，把 Set-Cookie 取回来（手机端自己设 cookie，绕开 WebView 的 SameSite 策略）。
+   *  Host 头必须写成手机将来访问用的 authority（比如 192.168.68.225:7627），
+   *  因为 DSH 签的 cookie 里带着 authority，校验时要求与请求的 Host 一致。 */
+  function fetchAuthCookie(authedUrl, authority) {
     return new Promise((resolve) => {
       let target
       try {
@@ -218,13 +220,14 @@ export function apply(ctx, config) {
         resolve('')
         return
       }
+      const hostHeader = authority && authority.length > 0 ? authority : `${options.upstreamHost}:${upstreamPort}`
       const req = http.request(
         {
           host: options.upstreamHost,
           port: upstreamPort,
           path: `${target.pathname}${target.search}`,
           method: 'GET',
-          headers: { host: `${options.upstreamHost}:${upstreamPort}` },
+          headers: { host: hostHeader },
         },
         (res) => {
           const raw = res.headers['set-cookie']
@@ -299,10 +302,22 @@ export function apply(ctx, config) {
         response.end(JSON.stringify({ ok: false, error: 'browser-auth-unavailable' }))
         return
       }
-      const hostname = String(request.headers.host ?? '127.0.0.1:0').split(':')[0]
+      const baseParam = url.searchParams.get('base')
+      let authority = String(request.headers.host ?? `127.0.0.1:${options.proxyPort}`)
+      if (baseParam) {
+        try {
+          const parsedBase = new URL(baseParam)
+          if (parsedBase.host) {
+            authority = parsedBase.host
+          }
+        } catch {
+          // base 解析不出来就用请求本身的 Host
+        }
+      }
+      const hostname = authority.split(':')[0]
       const target = `http://${hostname}:${options.proxyPort}/`
       const authed = browserAuth.authenticatedUrl(target)
-      fetchAuthCookie(authed).then((cookie) => {
+      fetchAuthCookie(authed, authority).then((cookie) => {
         if (!cookie) {
           response.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
           response.end(JSON.stringify({ ok: false, error: 'no-cookie' }))

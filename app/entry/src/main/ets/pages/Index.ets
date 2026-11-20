@@ -92,7 +92,7 @@ struct Index {
     };
     this.socket.connect(this.cfg.host, this.cfg.port, this.cfg.token);
     // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
-    const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token);
+    const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token, lanBase);
     if (cookie.length > 0) {
       try {
         webview.WebCookieManager.configCookieSync(lanBase, cookie);
