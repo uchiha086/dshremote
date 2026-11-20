@@ -244,7 +244,7 @@ export function apply(ctx, config) {
       ? ips.map((address) => ({ base: `http://${address}:${options.port}`, web: `http://${address}:${options.proxyPort}` }))
       : [{ base: `http://${ip}:${options.port}`, web: `http://${ip}:${options.proxyPort}` }]
     const lan = lanAll[0]
-    const pub = publicUrl ? { base: publicUrl, web: publicUrl } : null
+    const pub = tunnelFresh() ? { base: publicUrl, web: publicUrl } : null
     const choosePublic = Boolean(pub) && looksPublic(hostHeader)
     const target = choosePublic ? pub : lan
     // 二维码里同时带局域网与公网：手机在同一个 Wi-Fi 就直连，出了门自动改走隧道。
@@ -305,11 +305,18 @@ export function apply(ctx, config) {
       try { return new URL(info.lan.base).host } catch { return '' }
     })()
     if (lanHost) checks.push(await probe(`http://${lanHost}/health`, '局域网可达'))
-    if (info.public) {
-      checks.push(await probe(`${info.public.base}/health`, '隧道 → 桥'))
-      checks.push(await probe(`${info.public.base}/`, '隧道 → DSH'))
+    if (publicUrl && tunnelFresh()) {
+      checks.push(await probe(`${publicUrl}/health`, '隧道 → 桥'))
+      checks.push(await probe(`${publicUrl}/`, '隧道 → DSH'))
     } else {
-      checks.push({ name: '隧道', ok: false, ms: 0, detail: '未启用（config.tunnel 设为 auto 后重启 Desktop）' })
+      checks.push({
+        name: '隧道',
+        ok: false,
+        ms: 0,
+        detail: publicUrl
+          ? '地址已失效或还没就绪（Cloudflare 回收后会重建，稍等或重启 Desktop）'
+          : '未启用（config.tunnel 设为 auto 后重启 Desktop）',
+      })
     }
     return {
       ok: checks.every((check) => check.ok),
@@ -335,6 +342,7 @@ export function apply(ctx, config) {
       lanAll: info.lanAll,
       public: info.public,
       tunnel: info.public ? info.public.base : '',
+      tunnelPending: Boolean(publicUrl) && !tunnelFresh(),
       proxyPort: options.proxyPort,
     }
   }
@@ -813,6 +821,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         }
         publicUrl = value.replace(/\/+$/, '')
         writePublicUrl(publicUrl)
+        // 调用方（tools/tunnel.ps1）发布前已经打通过 /health，这里直接记为已校验。
+        tunnelVerifiedAt = Date.now()
+        trustHost(tunnelAuthority(publicUrl))
         log(`公网地址=${publicUrl}`)
       }
       response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -997,6 +1008,18 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   let tunnelTimer = null
   let tunnelAttempt = 0
   let tunnelStopped = false
+  // 只有"最近真的从公网打通 /health"的隧道才会写进二维码；否则宁可不给，免得手机扫到死链。
+  let tunnelVerifiedAt = 0
+  let tunnelWatch = null
+  const TUNNEL_FRESH_MS = 15 * 60 * 1000
+
+  function tunnelAuthority(value) {
+    return String(value ?? '').replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
+  }
+
+  function tunnelFresh() {
+    return Boolean(publicUrl) && tunnelVerifiedAt > 0 && Date.now() - tunnelVerifiedAt < TUNNEL_FRESH_MS
+  }
 
   function scheduleTunnel(delayMs) {
     if (tunnelStopped || tunnelTimer) return
@@ -1011,19 +1034,55 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     const clean = String(url).replace(/\/+$/, '')
     if (!/^https:\/\//.test(clean) || clean === publicUrl) return
     // cloudflared 的日志里会出现 api.trycloudflare.com 这类服务域名，不能当成隧道地址。
-    const authority = clean.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
+    const authority = tunnelAuthority(clean)
     if (!authority.endsWith('.trycloudflare.com')) return
     if (/^(api|www|dash|dashv2)\.trycloudflare\.com$/.test(authority)) return
     if (authority.split('-').length < 3) return
-    // 再自证一次：只有公网 /health 真的通了才发布，避免把错误地址写进二维码。
+    verifyTunnelSoon(clean, authority)
+  }
+
+  /** 校验几次再决定发布：cloudflared 刚建好时 DNS 还没铺开，一次失败不代表这条隧道是死的。 */
+  function verifyTunnelSoon(clean, authority, attempt = 1) {
     verifyTunnel(clean, authority).then((ok) => {
-      if (!ok || clean === publicUrl) return
-      publicUrl = clean
-      trustHost(authority)
-      writePublicUrl(publicUrl)
-      tunnelAttempt = 0
-      log(`隧道就绪 ${publicUrl}`)
+      if (ok) {
+        if (clean !== publicUrl) {
+          publicUrl = clean
+          trustHost(authority)
+          writePublicUrl(publicUrl)
+          log(`隧道就绪 ${publicUrl}`)
+        }
+        tunnelVerifiedAt = Date.now()
+        tunnelAttempt = 0
+        return
+      }
+      if (attempt >= 3) {
+        log(`隧道地址校验失败，先不写进二维码：${clean}`)
+        return
+      }
+      const timer = setTimeout(() => verifyTunnelSoon(clean, authority, attempt + 1), 4000 * attempt)
+      if (typeof timer.unref === 'function') timer.unref()
     })
+  }
+
+  /** 每 60 秒复核一次已发布的隧道：域名会被 Cloudflare 回收，回收后要立刻停止再用它。 */
+  function watchTunnel() {
+    if (tunnelWatch || tunnelStopped) return
+    tunnelWatch = setInterval(() => {
+      if (!publicUrl) return
+      const authority = tunnelAuthority(publicUrl)
+      if (!authority) return
+      verifyTunnel(publicUrl, authority).then((ok) => {
+        if (ok) {
+          tunnelVerifiedAt = Date.now()
+          return
+        }
+        if (tunnelVerifiedAt > 0) {
+          log(`隧道 ${publicUrl} 已失效，等待新地址`)
+        }
+        tunnelVerifiedAt = 0
+      })
+    }, 60_000)
+    if (typeof tunnelWatch.unref === 'function') tunnelWatch.unref()
   }
 
   /** 从本机经隧道打一次 /health，确认这条隧道真的能用。 */
@@ -1120,11 +1179,16 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       }
       log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'} trusted=${Array.isArray(trustedList) ? trustedList.length : 'no'}`)
       startTunnel()
+      watchTunnel()
     })()
 
     return () => {
       clearInterval(heartbeat)
       clearInterval(beaconTimer)
+      if (tunnelWatch) {
+        clearInterval(tunnelWatch)
+        tunnelWatch = null
+      }
       tunnelStopped = true
       if (tunnelTimer) {
         clearTimeout(tunnelTimer)
