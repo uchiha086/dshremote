@@ -1130,6 +1130,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       '--url', `http://127.0.0.1:${options.port}`,
       '--protocol', String(options.tunnelProtocol ?? 'http2'),
       '--no-autoupdate',
+      // precheck 要跑 30-60 秒，且本机 DNS 对 argotunnel.com 抖动时会拖更久；直接跳过，靠 verifyTunnel 自证。
+      '--no-prechecks',
       '--loglevel', 'info',
     ]
     let child
@@ -1151,6 +1153,19 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     }
     child.stdout?.on('data', onData)
     child.stderr?.on('data', onData)
+    // cloudflared 偶尔会卡在建隧道阶段（连上 edge 但迟迟不给 quick tunnel 地址），到点就重来。
+    if (tunnelTimer) clearTimeout(tunnelTimer)
+    tunnelTimer = setTimeout(() => {
+      tunnelTimer = null
+      if (tunnelChild !== child) return
+      log(`隧道 ${Math.round(Number(options.tunnelWaitMs ?? 90000) / 1000)}s 内没拿到地址，重启 cloudflared`)
+      try {
+        child.kill()
+      } catch {
+        // 杀不掉就让退出事件走重启流程。
+      }
+    }, Number(options.tunnelWaitMs ?? 90000))
+    if (typeof tunnelTimer.unref === 'function') tunnelTimer.unref()
     child.on('error', (error) => log(`隧道进程错误：${error?.message ?? error}`))
     child.on('exit', (code) => {
       tunnelChild = null
