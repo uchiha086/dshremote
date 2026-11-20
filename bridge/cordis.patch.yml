@@ -16,3 +16,7 @@
         answerHeadChars: 120
         questionChars: 200
         logFile: ''
+        # 隧道/公网的 host 写这里（或用 GET /trust?token=…&host=… 运行时登记），
+        # 都会被塞进 DSH 的 trustedHosts，否则公网访问会被 403 forbidden。
+        extraHosts: []
+        hostsFile: ''

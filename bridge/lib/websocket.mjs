@@ -169,14 +169,16 @@ class Connection extends EventEmitter {
  * 在已有 http.Server 上接管 /path 的 WebSocket 升级。
  * @returns {EventEmitter} 触发 'connection'（参数为 Connection）
  */
-export function createWebSocketServer(server, { path = '/ws', protocol = '' } = {}) {
+export function createWebSocketServer(server, { path = '/ws', protocol = '', fallback = null } = {}) {
   const emitter = new EventEmitter()
 
-  server.on('upgrade', (request, socket) => {
+  server.on('upgrade', (request, socket, head) => {
     const url = request.url ?? '/'
     const pathname = url.split('?')[0]
     if (pathname !== path) {
-      socket.destroy()
+      // 不是桥的端点：交给调用方决定（比如原样透传给 DSH 自己的长连接），否则直接断开。
+      if (typeof fallback === 'function') fallback(request, socket, head)
+      else socket.destroy()
       return
     }
     const key = request.headers['sec-websocket-key']

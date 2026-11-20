@@ -121,6 +121,24 @@ export class BridgeHttp {
       client.destroy();
     }
   }
+
+  /** 让桥把某个 host 加进 DSH 的 trustedHosts（隧道域名每次都会变，进主界面前自动登记一次）。 */
+  static async trust(baseUrl: string, token: string, host: string): Promise<boolean> {
+    const client = http.createHttp();
+    try {
+      const url = `${baseUrl}/trust?token=${encodeURIComponent(token)}&host=${encodeURIComponent(host)}`;
+      const response = await client.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 5000,
+        readTimeout: 5000
+      });
+      return response.responseCode === 200;
+    } catch (error) {
+      return false;
+    } finally {
+      client.destroy();
+    }
+  }
 }
 
 /** /events 的返回。 */
@@ -143,9 +161,9 @@ export class BridgePoller {
   onTurnEnd: (event: TurnEndEvent) => void = (event: TurnEndEvent) => {
   };
 
-  start(host: string, port: number, token: string): void {
+  start(baseUrl: string, token: string): void {
     this.stop();
-    this.baseUrl = `http://${host}:${port}`;
+    this.baseUrl = baseUrl;
     this.token = token;
     // 从此刻开始算，避免把桥里缓存的历史事件全部当新通知重放。
     this.since = Date.now();

@@ -34,6 +34,8 @@ const DEFAULT_OPTIONS = {
   questionChars: 200,
   logFile: '',
   tokenFile: '',
+  hostsFile: '',
+  extraHosts: [],
 }
 
 /** 读已保存的 token；只认长十六进制串，避免把脏内容当口令用。 */
@@ -124,10 +126,47 @@ export function apply(ctx, config) {
   // DSH 的 Host 围栏只放行回环、监听 bind IP 和 trustedHosts；手机走局域网 authority 会被 403。
   // 把本机各网卡 IPv4（桥端口 + 反代端口）注册进去，避免写死某个 IP。
   const trustedList = ctx.connection?.trustedHosts
+  const hostsFile = expandHome(options.hostsFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.hosts')
+
+  /** 把一个 authority（host 或 host:port）登记进 DSH 的白名单；重复登记无害。 */
+  function trustHost(authority) {
+    const value = String(authority ?? '').trim().toLowerCase()
+    if (!value || !Array.isArray(trustedList)) return false
+    if (!trustedList.includes(value)) trustedList.push(value)
+    return true
+  }
+
+  /** 把 tunnel / 公网 host 记到文件，Desktop 重启后自动放行（隧道域名每次会变，靠它续命）。 */
+  function rememberHost(authority) {
+    const value = String(authority ?? '').trim().toLowerCase()
+    if (!value) return
+    try {
+      const existing = fs.existsSync(hostsFile) ? fs.readFileSync(hostsFile, 'utf8') : ''
+      const lines = existing.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+      if (lines.includes(value)) return
+      fs.mkdirSync(path.dirname(hostsFile), { recursive: true })
+      fs.writeFileSync(hostsFile, `${[...lines, value].join('\n')}\n`, 'utf8')
+    } catch (error) {
+      log(`host 落盘失败：${error?.message ?? error}`)
+    }
+  }
+
+  function rememberedHosts() {
+    const wanted = []
+    if (Array.isArray(options.extraHosts)) wanted.push(...options.extraHosts)
+    try {
+      const text = fs.existsSync(hostsFile) ? fs.readFileSync(hostsFile, 'utf8') : ''
+      for (const line of text.split(/\r?\n/)) wanted.push(line)
+    } catch {
+      // 文件读不了就当没有。
+    }
+    return wanted
+  }
+
   if (Array.isArray(trustedList)) {
-    const wanted = localAuthorities([options.port, options.proxyPort, upstreamPort])
-    for (const authority of wanted) {
-      if (!trustedList.includes(authority)) trustedList.push(authority)
+    for (const authority of [...localAuthorities([options.port, options.proxyPort, upstreamPort]), ...rememberedHosts()]) {
+      const value = String(authority ?? '').trim().toLowerCase()
+      if (value && !trustedList.includes(value)) trustedList.push(value)
     }
   }
 
@@ -277,6 +316,58 @@ export function apply(ctx, config) {
     })
   }
 
+  /** 把非桥自身路由的请求原样转给 DSH。
+   *  Host 头**不改写**：隧道访问时 Host 是公网域名，DSH 的 cookie 与 trustedHosts 都按它来校验。 */
+  function proxyRequest(request, response) {
+    const headers = { ...request.headers }
+    if (!headers.host) headers.host = `${options.upstreamHost}:${upstreamPort}`
+    const upstreamRequest = http.request(
+      {
+        host: options.upstreamHost,
+        port: upstreamPort,
+        method: request.method,
+        path: request.url,
+        headers,
+      },
+      (upstreamResponse) => {
+        response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers)
+        upstreamResponse.pipe(response)
+      },
+    )
+    upstreamRequest.on('error', (error) => {
+      log(`HTTP 反代上游错误 ${error?.message ?? error}`)
+      if (!response.headersSent) {
+        response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
+        response.end('bridge: upstream unreachable')
+      } else {
+        response.destroy()
+      }
+    })
+    request.pipe(upstreamRequest)
+  }
+
+  /** 非 /ws 的 WebSocket 升级（DSH 自己的长连接）也照原样透传。 */
+  function proxyUpgrade(request, socket, head) {
+    const upstream = net.connect({ host: options.upstreamHost, port: upstreamPort }, () => {
+      const lines = [`${request.method} ${request.url} HTTP/1.1`]
+      for (let i = 0; i < request.rawHeaders.length; i += 2) {
+        lines.push(`${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}`)
+      }
+      upstream.write(`${lines.join('\r\n')}\r\n\r\n`)
+      if (head && head.length > 0) upstream.write(head)
+      socket.pipe(upstream).pipe(socket)
+    })
+    const close = () => {
+      socket.destroy()
+      upstream.destroy()
+    }
+    socket.on('error', close)
+    upstream.on('error', (error) => {
+      log(`WS 反代上游错误 ${error?.message ?? error}`)
+      close()
+    })
+  }
+
   const server = http.createServer((request, response) => {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
 
@@ -335,18 +426,19 @@ export function apply(ctx, config) {
       }
       const baseParam = url.searchParams.get('base')
       let authority = String(request.headers.host ?? `127.0.0.1:${options.proxyPort}`)
+      let target = `http://${String(authority).split(':')[0]}:${options.proxyPort}/`
       if (baseParam) {
         try {
           const parsedBase = new URL(baseParam)
           if (parsedBase.host) {
             authority = parsedBase.host
+            // 隧道是 https 且没有端口，直接用手机给的 base 当目标，别硬拼 7627。
+            target = `${parsedBase.origin}/`
           }
         } catch {
           // base 解析不出来就用请求本身的 Host
         }
       }
-      const hostname = authority.split(':')[0]
-      const target = `http://${hostname}:${options.proxyPort}/`
       const authed = browserAuth.authenticatedUrl(target)
       fetchAuthCookie(authed, authority).then((cookie) => {
         if (!cookie) {
@@ -374,11 +466,31 @@ export function apply(ctx, config) {
       return
     }
 
-    response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
-    response.end(JSON.stringify({ ok: false, error: 'not-found' }))
+    if (url.pathname === '/trust') {
+      if (url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      const host = String(url.searchParams.get('host') ?? '').trim()
+      if (!host) {
+        response.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'missing-host' }))
+        return
+      }
+      const added = trustHost(host)
+      rememberHost(host)
+      log(`信任 host ${host}${added ? '' : '（trustedHosts 不可写）'}`)
+      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(JSON.stringify({ ok: true, host, trusted: Array.isArray(trustedList) ? trustedList.length : 0 }))
+      return
+    }
+
+    // 其余路径原样转给 DSH：这样一条隧道（指向 3088）就能同时当网页入口和控制接口用。
+    proxyRequest(request, response)
   })
 
-  const wss = createWebSocketServer(server, { path: '/ws', protocol: WS_PROTOCOL })
+  const wss = createWebSocketServer(server, { path: '/ws', protocol: WS_PROTOCOL, fallback: proxyUpgrade })
 
   wss.on('connection', (ws, request) => {
     const client = {

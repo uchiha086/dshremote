@@ -11,6 +11,7 @@ struct Index {
   @State hostInput: string = '';
   @State portInput: string = '3088';
   @State tokenInput: string = '';
+  @State tunnelInput: string = '';
   @State statusText: string = '未连接';
   @State testResult: string = '';
   @State busy: boolean = false;
@@ -30,6 +31,7 @@ struct Index {
       this.hostInput = loaded.host;
       this.portInput = `${loaded.port}`;
       this.tokenInput = loaded.token;
+      this.tunnelInput = loaded.tunnel;
       if (loaded.valid()) {
         this.stage = 'main';
         await this.enterMain();
@@ -52,6 +54,7 @@ struct Index {
     }
     cfg.token = this.tokenInput.trim();
     cfg.proxyPort = 7627;
+    cfg.tunnel = this.tunnelInput.trim();
     return cfg;
   }
 
@@ -98,7 +101,13 @@ struct Index {
         }
       });
     };
-    this.poller.start(this.cfg.host, this.cfg.port, this.cfg.token);
+    this.poller.start(this.cfg.baseUrl(), this.cfg.token);
+    // 走隧道时先把公网域名登记进 DSH 的 trustedHosts，否则页面里的 /api 会 403。
+    const tunnel = this.cfg.tunnelUrl();
+    if (tunnel.length > 0) {
+      const authority = tunnel.replace('https://', '').replace('http://', '').split('/')[0];
+      await BridgeHttp.trust(this.cfg.baseUrl(), this.cfg.token, authority);
+    }
     // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
     const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token, lanBase);
     if (cookie.length > 0) {
@@ -140,6 +149,12 @@ struct Index {
       TextInput({ placeholder: '配对 token', text: this.tokenInput })
         .onChange((value: string) => {
           this.tokenInput = value;
+        })
+        .width('100%')
+
+      TextInput({ placeholder: '隧道地址（可选，https://xxx.trycloudflare.com）', text: this.tunnelInput })
+        .onChange((value: string) => {
+          this.tunnelInput = value;
         })
         .width('100%')
 
