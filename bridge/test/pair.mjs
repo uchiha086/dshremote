@@ -2,12 +2,15 @@
 // 用假 ctx 起一份桥，不需要真的 DSH 宿主。
 import dgram from 'node:dgram'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 import { apply } from '../lib/index.mjs'
 
 const TOKEN = 'testtoken0123456789abcdef'
 const PORT = 3201
 const PROXY_PORT = 3200
 const DISCOVERY_PORT = 3202
+const TMP = path.join(os.tmpdir(), 'dshremote-test')
 
 let disposer = null
 const ctx = {
@@ -23,10 +26,10 @@ apply(ctx, {
   port: PORT,
   proxyPort: PROXY_PORT,
   token: TOKEN,
-  tokenFile: 'C:\\Users\\user\\Documents\\deepseek-harness\\default-workspace\\bridge-test.token',
-  hostsFile: 'C:\\Users\\user\\Documents\\deepseek-harness\\default-workspace\\bridge-test.hosts',
-  publicUrlFile: 'C:\\Users\\user\\Documents\\deepseek-harness\\default-workspace\\bridge-test.public',
-  logFile: 'C:\\Users\\user\\Documents\\deepseek-harness\\default-workspace\\bridge-test.log',
+  tokenFile: path.join(TMP, 'bridge-test.token'),
+  hostsFile: path.join(TMP, 'bridge-test.hosts'),
+  publicUrlFile: path.join(TMP, 'bridge-test.public'),
+  logFile: path.join(TMP, 'bridge-test.log'),
   proxyEnabled: false,
   discoveryPort: DISCOVERY_PORT,
 })

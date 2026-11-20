@@ -155,7 +155,7 @@ export function apply(ctx, config) {
       '帮我修一下这台电脑上的 DSH Remote 桥（dshremote-bridge）。',
       '',
       `桥服务：http://127.0.0.1:${options.port}（反代 ${options.proxyPort}，上游 127.0.0.1:${upstreamPort}）`,
-      `仓库：C:\\Users\\user\\Desktop\\dshremote（bridge/ 是插件，app/ 是鸿蒙手机端）`,
+      `仓库：<repo>/bridge（bridge/ 是电脑端插件，app/ 是鸿蒙端，android/ 是安卓端）`,
       `cloudflared：${options.cloudflaredPath}（隧道模式 ${options.tunnel}，协议 ${options.tunnelProtocol}）`,
       '',
       '刚才的体检结果：',

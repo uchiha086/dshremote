@@ -1,4 +1,6 @@
 import { WebSocket } from 'ws'
+import os from 'node:os'
+import path from 'node:path'
 import { apply } from '../lib/index.mjs'
 
 const PORT = 3399
@@ -52,8 +54,8 @@ async function main() {
     proxyPort: PROXY_PORT,
     bind: '127.0.0.1',
     token: TOKEN,
-    tokenFile: 'C:\\Users\\user\\Desktop\\dshremote\\bridge\\test\\smoke.token',
-    logFile: 'C:\\Users\\user\\Desktop\\dshremote\\bridge\\test\\smoke.log',
+    tokenFile: path.join(os.tmpdir(), 'dshremote-smoke.token'),
+    logFile: path.join(os.tmpdir(), 'dshremote-smoke.log'),
   })
   await sleep(600)
 
