@@ -627,7 +627,12 @@ export function apply(ctx, config) {
         response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
         return
       }
-      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      response.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+        // Web UI 走 7627（反代端口）时与桥不同源，配对面板要能跨源取数据。
+        'access-control-allow-origin': '*',
+      })
       response.end(JSON.stringify(pairingJson(host)))
       return
     }

@@ -1,4 +1,4 @@
-# 启动 Cloudflare 快速隧道，并把公网域名登记进桥插件的 trustedHosts。
+﻿# 启动 Cloudflare 快速隧道，并把公网域名登记进桥插件的 trustedHosts。
 # 用法： .\tools\tunnel.ps1                 （隧道指向桥的 3088 端口，一条地址同时提供网页和控制接口）
 #        .\tools\tunnel.ps1 -Protocol quic （默认 http2；本机 QUIC/UDP 7844 被挡，必须走 http2）
 #        .\tools\tunnel.ps1 -Stop          （停掉所有 cloudflared）

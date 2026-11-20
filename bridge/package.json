@@ -1,25 +1,38 @@
 {
   "name": "dshremote-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "DSH Remote 桥插件：监听 DSH 的回合结束事件并推送给手机，同时把 DSH Web 反代到局域网端口。",
+  "description": "DSH Remote 桥插件：监听 DSH 的回合结束事件并推送给手机，把 DSH Web 反代到局域网端口，并在 Web UI 左下角提供配对二维码。",
   "main": "lib/index.mjs",
   "exports": {
-    ".": "./lib/index.mjs"
+    ".": "./lib/index.mjs",
+    "./client": "./client.js"
   },
   "files": [
     "lib",
+    "client.js",
     "cordis.patch.yml",
     "README.md"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
     }
   },
   "engines": {
     "node": ">=24.9"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "ws": "^8.23.0"
+  }
 }
