@@ -163,6 +163,8 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState({ phase: 'idle' })
       const [copied, setCopied] = React.useState(false)
       const [attempt, setAttempt] = React.useState(0)
+      const [busy, setBusy] = React.useState('')
+      const [notice, setNotice] = React.useState(null)
 
       React.useEffect(() => {
         if (!isOpen) {
@@ -197,6 +199,47 @@ window.__ModuleLoader__.load({
       const lan = diag?.lan ?? ''
       const tunnel = diag?.tunnel ?? ''
       const origin = typeof window !== 'undefined' ? window.location.origin : ''
+
+      const rootOf = (value) => `${value?.base ?? ''}${value?.prefix ?? ''}`
+
+      // 一键修复：重拉隧道并等到公网可用，再自动重跑体检。
+      const repair = async () => {
+        setBusy('repair')
+        setNotice({ ok: true, text: '正在重拉隧道，最多等 2 分钟…' })
+        try {
+          const response = await fetch(`${rootOf(diag)}/repair`, { cache: 'no-store' })
+          const result = await response.json()
+          if (result.ok) {
+            setNotice({ ok: true, text: `隧道已恢复：${result.tunnel}（${Math.round((result.waitedMs ?? 0) / 1000)}s）` })
+          } else {
+            setNotice({ ok: false, text: `没修好：${result.error ?? '未知原因'}，可以点「让 AI 修」` })
+          }
+        } catch (error) {
+          setNotice({ ok: false, text: `修复请求失败：${error?.message ?? error}` })
+        } finally {
+          setBusy('')
+          setAttempt((value) => value + 1)
+        }
+      }
+
+      // 让 AI 修：让桥在 DSH 里开一个新会话，把体检结果直接发过去。
+      const aiFix = async () => {
+        setBusy('ai')
+        setNotice({ ok: true, text: '正在新开一个修复会话…' })
+        try {
+          const response = await fetch(`${rootOf(diag)}/ai-fix`, { cache: 'no-store' })
+          const result = await response.json()
+          if (result.ok) {
+            setNotice({ ok: true, text: '已在新会话里开始修复，切到会话列表看最新那条。' })
+          } else {
+            setNotice({ ok: false, text: `AI 会话没起来：${result.error ?? '未知原因'}` })
+          }
+        } catch (error) {
+          setNotice({ ok: false, text: `请求失败：${error?.message ?? error}` })
+        } finally {
+          setBusy('')
+        }
+      }
 
       const copy = () => {
         const write = navigator.clipboard?.writeText?.(payload)
@@ -309,6 +352,37 @@ window.__ModuleLoader__.load({
               fontSize: 13, cursor: payload ? 'pointer' : 'default',
             },
           }, copied ? '已复制' : '复制配对链接'),
+        ),
+        h('div', { style: { marginTop: 8, display: 'flex', gap: 8 } },
+          h('button', {
+            type: 'button', onClick: repair, disabled: busy !== '',
+            style: {
+              flex: 1, padding: '9px 12px', borderRadius: 9, border: 'none',
+              background: '#10b981',
+              color: '#fff', fontSize: 13, cursor: busy === '' ? 'pointer' : 'default',
+              opacity: busy !== '' && busy !== 'repair' ? 0.6 : 1,
+            },
+          }, busy === 'repair' ? '正在修复…' : '一键修复'),
+          h('button', {
+            type: 'button', onClick: aiFix, disabled: busy !== '',
+            style: {
+              flex: 1, padding: '9px 12px', borderRadius: 9, border: '1px solid #c7d2fe',
+              background: '#eef2ff', color: '#3730a3', fontSize: 13,
+              cursor: busy === '' ? 'pointer' : 'default',
+              opacity: busy !== '' && busy !== 'ai' ? 0.6 : 1,
+            },
+          }, busy === 'ai' ? '正在叫 AI…' : '让 AI 修'),
+        ),
+        notice
+          ? h('div', {
+            style: {
+              marginTop: 8, fontSize: 11, lineHeight: 1.5, wordBreak: 'break-all',
+              color: notice.ok ? '#047857' : '#b45309',
+            },
+          }, notice.text)
+          : null,
+        h('div', { style: { marginTop: 10, fontSize: 11, color: '#9ca3af', lineHeight: 1.5 } },
+          '一键修复会重拉隧道并等到公网可用；让 AI 修会在 DSH 里开一个新会话，把体检结果交给它处理。',
         ),
         h('div', { style: { marginTop: 10, fontSize: 11, color: '#9ca3af', lineHeight: 1.5 } },
           '手机 App：没连接过会自动进入扫码页，扫完直接进 DSH；右上角只有设置入口。',

@@ -128,11 +128,51 @@ export function apply(ctx, config) {
   const logFile = expandHome(options.logFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.log')
   // token 要跨重启稳定：优先用配置里的，其次沿用上次落盘的，最后才随机生成。
   const tokenFile = expandHome(options.tokenFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.token')
+  const STORE_DIR = path.dirname(tokenFile)
   const token = String(options.token ?? '').trim() || readToken(tokenFile) || crypto.randomBytes(16).toString('hex')
 
   // DSH Web 每次启动端口可能不同（7626、10628…），以宿主 webServer 实际端口为准。
   const webPort = Number(ctx.webServer?.port)
   const upstreamPort = Number.isFinite(webPort) && webPort > 0 ? webPort : options.upstreamPort
+
+  // 让 AI 修：借宿主的 typert 网关，以 owner 身份开新会话并把体检结果发过去。
+  const typertGateway = ctx.typertGateway
+  let sessionPeer = null
+  function ownerPeer() {
+    if (sessionPeer) return sessionPeer
+    try {
+      sessionPeer = ctx.connection?.createPeer?.({ principal: { kind: 'owner' }, interactions: 'none' }) ?? null
+    } catch {
+      sessionPeer = null
+    }
+    return sessionPeer
+  }
+
+  /** 给 AI 的修复简报：把这次体检的每一项都写进去，省得它再猜。 */
+  function repairBrief(diag) {
+    const lines = [
+      '帮我修一下这台电脑上的 DSH Remote 桥（dshremote-bridge）。',
+      '',
+      `桥服务：http://127.0.0.1:${options.port}（反代 ${options.proxyPort}，上游 127.0.0.1:${upstreamPort}）`,
+      `仓库：C:\\Users\\user\\Desktop\\dshremote（bridge/ 是插件，app/ 是鸿蒙手机端）`,
+      `cloudflared：${options.cloudflaredPath}（隧道模式 ${options.tunnel}，协议 ${options.tunnelProtocol}）`,
+      '',
+      '刚才的体检结果：',
+    ]
+    for (const check of diag?.checks ?? []) {
+      lines.push(`- ${check.ok ? 'OK ' : 'FAIL'} ${check.name}：${check.detail}（${check.ms}ms）`)
+    }
+    if (diag?.tunnel) lines.push(`- 当前隧道地址：${diag.tunnel}`)
+    lines.push(
+      '',
+      '要求：',
+      '1. 先跑 `node bridge/test/pair.mjs` 和 `node bridge/test/smoke.mjs` 确认没被我改坏；',
+      '2. 定位为什么隧道不可用（本机 DNS 对 argotunnel.com 会抖，quick tunnel 域名会被回收）；',
+      '3. 修好后用 `GET http://127.0.0.1:3088/pair/test` 确认五项全绿，并把结果贴给我；',
+      '4. 只改 bridge/ 下的文件，别动 app/ 的 ArkTS 代码（那边我这边验证）。',
+    )
+    return lines.join('\n')
+  }
 
   // DSH Web 用「进程启动令牌 + 按 authority 绑定的 cookie」鉴权：打开带 ?token= 的地址会下发 cookie。
   // 这里借宿主的 BrowserAuth 帮手机生成一次这样的地址，手机打开一次之后 cookie 就长期有效。
@@ -831,6 +871,99 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       return
     }
 
+    // 一键修复：把卡住的隧道进程换掉，等到一条真的能被公网访问的地址再返回。
+    if (url.pathname === '/repair') {
+      const startedRepair = Date.now()
+      void (async () => {
+        const reply = (status, body) => {
+          response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(JSON.stringify(body))
+        }
+        if (String(options.tunnel ?? 'off') !== 'auto') {
+          reply(200, { ok: false, error: 'tunnel-disabled', hint: 'config.tunnel 不是 auto，先改 cordis.patch.yml 再重启 Desktop' })
+          return
+        }
+        // 1) 收掉现有进程（可能卡在建隧道阶段），清掉可能已失效的旧地址。
+        tunnelVerifiedAt = 0
+        publicUrl = ''
+        writePublicUrl('')
+        if (tunnelChild) {
+          try {
+            tunnelChild.kill()
+          } catch {
+            // 退出事件会负责重启
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1500))
+        }
+        tunnelAttempt = 0
+        if (tunnelTimer) {
+          clearTimeout(tunnelTimer)
+          tunnelTimer = null
+        }
+        // 2) 重新拉起，最多等 120 秒。
+        if (!tunnelChild) startTunnel()
+        const deadline = Date.now() + 120_000
+        while (Date.now() < deadline) {
+          if (publicUrl && tunnelFresh()) break
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+        const tunnelUrl = tunnelFresh() ? publicUrl : ''
+        log(tunnelUrl ? `一键修复完成 ${tunnelUrl}` : '一键修复失败：120 秒内没拿到可用隧道')
+        const result = await pairTest()
+        reply(200, {
+          ok: Boolean(tunnelUrl) && result.ok,
+          tunnel: tunnelUrl || null,
+          waitedMs: Date.now() - startedRepair,
+          checks: result.checks,
+          error: tunnelUrl ? undefined : 'tunnel-unavailable',
+        })
+      })()
+      return
+    }
+
+    // 让 AI 修：在当前 DSH 里开一个新会话，把体检结果和修复要点直接发给它。
+    if (url.pathname === '/ai-fix') {
+      void (async () => {
+        const reply = (status, body) => {
+          response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(JSON.stringify(body))
+        }
+        const diag = await pairTest()
+        const prompt = repairBrief(diag)
+        try {
+          if (!typertGateway?.invoke) throw new Error('typertGateway 不可用')
+          const created = await typertGateway.invoke({
+            namespace: 'session',
+            method: 'create',
+            args: { request: { cwd: STORE_DIR } },
+            peer: ownerPeer(),
+          })
+          const sessionId = created?.sessionId ?? created?.id
+          if (!sessionId) throw new Error('session/create 没有返回 sessionId')
+          await typertGateway.invoke({
+            namespace: 'session',
+            method: 'prompt',
+            args: {
+              request: {
+                requestId: crypto.randomUUID(),
+                sessionId,
+                mode: 'queue',
+                content: [{ type: 'text', text: prompt }],
+              },
+            },
+            peer: ownerPeer(),
+          })
+          log(`AI 修复会话已创建 ${sessionId}`)
+          reply(200, { ok: true, sessionId, prompt })
+        } catch (error) {
+          const message = error?.message ?? String(error)
+          log(`AI 修复没能起会话：${message}`)
+          reply(200, { ok: false, error: message, prompt })
+        }
+      })()
+      return
+    }
+
     // 其余路径原样转给 DSH：这样一条隧道（指向 3088）就能同时当网页入口和控制接口用。
     proxyRequest(request, response)
   }
@@ -841,7 +974,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   // 浏览器的私有网络访问（Private Network Access）策略拦成 "Failed to fetch"。
   // 所以把同一套接口在 DSH 自己的 web 服务上再挂一遍，面板改用同源相对路径。
   const SAME_ORIGIN_PREFIX = '/dshremote'
-  const sameOriginRoutes = ['/health', '/pair', '/pair.svg', '/pair.png', '/pair.html', '/pair/test']
+  const sameOriginRoutes = ['/health', '/pair', '/pair.svg', '/pair.png', '/pair.html', '/pair/test', '/repair', '/ai-fix']
   const sameOriginDisposers = []
   if (typeof ctx.webServer?.register === 'function') {
     for (const suffix of sameOriginRoutes) {
@@ -1268,4 +1401,4 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   })
 }
 
-export default { name: 'dshremote-bridge', inject: ['connection', 'webServer'], apply }
+export default { name: 'dshremote-bridge', inject: ['connection', 'webServer', 'typertGateway'], apply }
