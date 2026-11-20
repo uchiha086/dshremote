@@ -1,10 +1,15 @@
 # 启动 Cloudflare 快速隧道，并把公网域名登记进桥插件的 trustedHosts。
-# 用法： .\tools\tunnel.ps1            （隧道指向桥的 3088 端口，一条地址同时提供网页和控制接口）
-#        .\tools\tunnel.ps1 -Stop      （停掉所有 cloudflared）
+# 用法： .\tools\tunnel.ps1                 （隧道指向桥的 3088 端口，一条地址同时提供网页和控制接口）
+#        .\tools\tunnel.ps1 -Protocol quic （默认 http2；本机 QUIC/UDP 7844 被挡，必须走 http2）
+#        .\tools\tunnel.ps1 -Stop          （停掉所有 cloudflared）
+#
+# 说明：快速隧道的域名每次重启都会变，电脑重启或杀掉 cloudflared 后需要重新跑本脚本。
 
 param(
   [int]$BridgePort = 3088,
   [string]$Token = '',
+  [ValidateSet('http2', 'quic', 'auto')]
+  [string]$Protocol = 'http2',
   [switch]$Stop
 )
 
@@ -22,26 +27,41 @@ if ([string]::IsNullOrWhiteSpace($Token)) {
   $Token = (Get-Content "$env:USERPROFILE\.dsh\dshremote-bridge.token" -Raw).Trim()
 }
 
-# 上一个隧道先关掉，避免多个 cloudflared 抢连接
-Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 500
-
 $log = Join-Path $env:TEMP 'cloudflared-dshremote.log'
-if (Test-Path $log) { Remove-Item $log -Force }
-
-$proc = Start-Process -FilePath $exe `
-  -ArgumentList 'tunnel', '--url', "http://127.0.0.1:$BridgePort", '--no-autoupdate', '--loglevel', 'info', '--logfile', $log `
-  -PassThru -WindowStyle Hidden
-
 $url = ''
-for ($i = 0; $i -lt 120; $i++) {
+$proc = $null
+
+# 本机 DNS 对 argotunnel.com 偶发失败，所以整体最多试三次
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+  # 上一个隧道先关掉，避免多个 cloudflared 抢连接
+  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Milliseconds 500
-  if (Test-Path $log) {
-    $hit = Select-String -Path $log -Pattern 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' | Select-Object -First 1
-    if ($hit) { $url = $hit.Matches[0].Value; break }
+  if (Test-Path $log) { Remove-Item $log -Force }
+
+  $proc = Start-Process -FilePath $exe `
+    -ArgumentList 'tunnel', '--url', "http://127.0.0.1:$BridgePort", '--protocol', $Protocol, '--no-autoupdate', '--loglevel', 'info', '--logfile', $log `
+    -PassThru -WindowStyle Hidden
+
+  for ($i = 0; $i -lt 120; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $log) {
+      $hit = Select-String -Path $log -Pattern 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com' | Select-Object -First 1
+      if ($hit) { $url = $hit.Matches[0].Value; break }
+    }
+    if ($proc.HasExited) { break }
   }
+  if ($url) { break }
+  Write-Host "第 $attempt 次没拿到隧道地址（多半是 DNS/SRV 抖动），重试…"
+  $url = ''
 }
-if (-not $url) { throw "20 秒内没拿到隧道地址，看日志：$log" }
+
+if (-not $url) { throw "三次都没拿到隧道地址，看日志：$log" }
+
+# 等隧道真正注册上（Registered tunnel connection），否则手机可能瞬间 502
+for ($i = 0; $i -lt 40; $i++) {
+  if (Select-String -Path $log -Pattern 'Registered tunnel connection' -Quiet) { break }
+  Start-Sleep -Milliseconds 500
+}
 
 $authority = ([Uri]$url).Host
 $trustUrl = "http://127.0.0.1:$BridgePort/trust?token=$Token&host=$authority"
@@ -56,6 +76,7 @@ try {
 Write-Host ''
 Write-Host "隧道地址  : $url"
 Write-Host "已登记信任: $trusted（$authority）"
+Write-Host "传输协议  : $Protocol"
 Write-Host "PID       : $($proc.Id)    日志: $log"
 Write-Host ''
 Write-Host '手机端：设置 → 隧道地址 填上面这个 URL，然后「保存并进入」。'
