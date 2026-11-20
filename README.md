@@ -10,7 +10,7 @@
 [![HarmonyOS NEXT](https://img.shields.io/badge/HarmonyOS%20NEXT-API%2026-000000)](https://developer.huawei.com/consumer/cn/harmonyos/)
 [![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84)](https://developer.android.com/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
-[![Android APK](https://img.shields.io/badge/download-APK%2041%20KB-3DDC84)](https://github.com/uchiha086/dshremote/releases/tag/v0.2.0-android)
+[![Android APK](https://img.shields.io/badge/download-APK%2041%20KB-3DDC84)](https://github.com/uchiha086/dshremote/releases/tag/v0.2.1-android)
 
 <img src="docs/icon.png" width="128" alt="DSH Remote 图标">
 
@@ -62,7 +62,7 @@ DSH 是个桌面版 Agent，人离开了电脑就没法盯进度。现有的远�
 
 ## 获取方式
 
-**安卓**：直接下载 [`dshremote-android-0.2.0.apk`](https://github.com/uchiha086/dshremote/releases/tag/v0.2.0-android)（41 KB，Android 7.0+，全平台通用，v2/v3 签名）。
+**安卓**：直接下载 [`dshremote-android-0.2.1.apk`](https://github.com/uchiha086/dshremote/releases/tag/v0.2.1-android)（41 KB，Android 7.0+，全平台通用，v2/v3 签名）。
 
 **鸿蒙**：只发源码。因为开发签名会把证书绑定在签名人自己的设备 UDID 上（`.p7b` 里 `debug-info.device-ids` 只有一台），别人下载了也装不上——所以请按 [docs/使用与签名.md](docs/使用与签名.md) 用你自己的华为账号签名后构建。
 
