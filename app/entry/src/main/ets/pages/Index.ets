@@ -159,6 +159,11 @@ struct Index {
       if (this.testResult.length > 0) {
         Text(this.testResult).fontSize(13).fontColor('#0a7').textAlign(TextAlign.Center)
       }
+
+      Text('v0.1.0 · 需要电脑端 dshremote-bridge 插件')
+        .fontSize(11)
+        .fontColor('#999999')
+        .margin({ top: 8 })
     }
     .padding({ left: 24, right: 24 })
     .width('100%')
