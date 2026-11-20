@@ -208,6 +208,41 @@ export function apply(ctx, config) {
   const disposeEvents = ctx.on('session/event', onSessionEvent)
   const disposeStatus = ctx.on('api-session/status', onSessionStatus)
 
+  /** 顺着带 tokened 的地址打一次上游，把 Set-Cookie 取回来（手机端自己设 cookie，绕开 WebView 的 SameSite 策略）。 */
+  function fetchAuthCookie(authedUrl) {
+    return new Promise((resolve) => {
+      let target
+      try {
+        target = new URL(authedUrl)
+      } catch {
+        resolve('')
+        return
+      }
+      const req = http.request(
+        {
+          host: options.upstreamHost,
+          port: upstreamPort,
+          path: `${target.pathname}${target.search}`,
+          method: 'GET',
+          headers: { host: `${options.upstreamHost}:${upstreamPort}` },
+        },
+        (res) => {
+          const raw = res.headers['set-cookie']
+          res.resume()
+          const list = Array.isArray(raw) ? raw : raw ? [raw] : []
+          const first = list.find((item) => item.startsWith('dsh-auth-'))
+          resolve(first ? first.split(';')[0] : '')
+        },
+      )
+      req.setTimeout(5000, () => {
+        req.destroy()
+        resolve('')
+      })
+      req.on('error', () => resolve(''))
+      req.end()
+    })
+  }
+
   const server = http.createServer((request, response) => {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
 
@@ -250,6 +285,32 @@ export function apply(ctx, config) {
         response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
         response.end(JSON.stringify({ ok: false, error: 'failed' }))
       }
+      return
+    }
+
+    if (url.pathname === '/auth/cookie') {
+      if (url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      if (!browserAuth?.authenticatedUrl) {
+        response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'browser-auth-unavailable' }))
+        return
+      }
+      const hostname = String(request.headers.host ?? '127.0.0.1:0').split(':')[0]
+      const target = `http://${hostname}:${options.proxyPort}/`
+      const authed = browserAuth.authenticatedUrl(target)
+      fetchAuthCookie(authed).then((cookie) => {
+        if (!cookie) {
+          response.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
+          response.end(JSON.stringify({ ok: false, error: 'no-cookie' }))
+          return
+        }
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        response.end(JSON.stringify({ ok: true, url: target, cookie }))
+      })
       return
     }
 

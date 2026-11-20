@@ -14,6 +14,7 @@ struct Index {
   @State testResult: string = '';
   @State busy: boolean = false;
   @State webUrl: string = '';
+  @State webReady: boolean = false;
 
   private controller: webview.WebviewController = new webview.WebviewController();
   private cfg: BridgeConfig = new BridgeConfig();
@@ -81,7 +82,7 @@ struct Index {
 
   private async enterMain(): Promise<void> {
     const lanBase = this.cfg.webUrl();
-    this.webUrl = lanBase;
+    this.webReady = false;
     this.socket.onStatus = (text: string) => {
       this.statusText = text;
     };
@@ -90,11 +91,19 @@ struct Index {
       this.statusText = `回合结束 · ${title}`;
     };
     this.socket.connect(this.cfg.host, this.cfg.port, this.cfg.token);
-    // 首次进主界面时，用桥签发的地址登录一次，之后 WebView 靠 cookie 免登录。
-    const auth = await BridgeHttp.authUrl(this.cfg.baseUrl(), this.cfg.token, lanBase);
-    if (auth.length > 0) {
-      this.webUrl = auth;
+    // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
+    const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token);
+    if (cookie.length > 0) {
+      try {
+        webview.WebCookieManager.configCookieSync(lanBase, cookie);
+      } catch (error) {
+        this.statusText = '写登录 cookie 失败';
+      }
     }
+    this.statusText = cookie.length > 0 ? '正在打开 DSH…' : '未取得登录 cookie';
+    // cookie 写好之后再挂 Web 组件，避免先加载出 401 页面。
+    this.webUrl = lanBase;
+    this.webReady = true;
   }
 
   @Builder
@@ -169,14 +178,24 @@ struct Index {
       .width('100%')
       .padding({ left: 12, right: 12, top: 4, bottom: 4 })
 
-      Web({ src: this.webUrl, controller: this.controller })
-        .domStorageAccess(true)
-        .fileAccess(false)
+      if (this.webReady) {
+        Web({ src: this.webUrl, controller: this.controller })
+          .domStorageAccess(true)
+          .fileAccess(false)
+          .width('100%')
+          .layoutWeight(1)
+          .onPageEnd(() => {
+            this.statusText = 'DSH 已加载';
+          })
+      } else {
+        Column({ space: 10 }) {
+          LoadingProgress().width(48).height(48)
+          Text(this.statusText).fontSize(13).fontColor('#888888')
+        }
         .width('100%')
         .layoutWeight(1)
-        .onPageEnd(() => {
-          this.statusText = '页面已加载 · ' + this.statusText;
-        })
+        .justifyContent(FlexAlign.Center)
+      }
     }
     .width('100%')
     .height('100%')

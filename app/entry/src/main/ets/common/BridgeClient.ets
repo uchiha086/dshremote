@@ -15,6 +15,13 @@ interface AuthUrlResult {
   url: string;
 }
 
+/** /auth/cookie 的返回：登录地址 + 可直接写进 WebView 的 cookie。 */
+interface AuthCookieResult {
+  ok: boolean;
+  url: string;
+  cookie: string;
+}
+
 /** 桥插件推来的帧，字段按需取。 */
 interface WireFrame {
   type: string;
@@ -26,6 +33,7 @@ interface WireFrame {
   turn: number;
   proxyPort: number;
   ts: number;
+  code: string;
 }
 
 /** 一条"回合结束"事件，手机据此弹通知。 */
@@ -91,6 +99,28 @@ export class BridgeHttp {
       client.destroy();
     }
   }
+
+  /** 向桥要一份可以直接写进 WebView 的登录 cookie。 */
+  static async authCookie(baseUrl: string, token: string): Promise<string> {
+    const client = http.createHttp();
+    try {
+      const url = `${baseUrl}/auth/cookie?token=${encodeURIComponent(token)}`;
+      const response = await client.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 5000,
+        readTimeout: 8000
+      });
+      if (response.responseCode !== 200) {
+        return '';
+      }
+      const body = JSON.parse(String(response.result)) as AuthCookieResult;
+      return body.ok ? body.cookie : '';
+    } catch (error) {
+      return '';
+    } finally {
+      client.destroy();
+    }
+  }
 }
 
 /** 与桥插件的 WebSocket 长连接：负责鉴权、心跳与推送解析。 */
@@ -122,9 +152,7 @@ export class BridgeSocket {
     this.ws = ws;
 
     ws.on('open', () => {
-      this.onStatus('已连接');
-      ws.send(JSON.stringify({ type: 'auth', token: this.token, deviceName: 'HOP-AL10' }));
-      this.startHeartbeat();
+      this.sendAuth();
     });
 
     ws.on('message', (err: BusinessError, data: string | ArrayBuffer) => {
@@ -137,7 +165,11 @@ export class BridgeSocket {
         return;
       }
       if (frame.type === 'hello') {
-        this.onStatus(`已连接 · 桥 ${frame.ts > 0 ? 'v1' : 'v1'}`);
+        this.onStatus('已连接 · 推送就绪');
+        return;
+      }
+      if (frame.type === 'error') {
+        this.onStatus(`桥拒绝：${frame.code}`);
         return;
       }
       if (frame.type === 'turn_end') {
@@ -169,8 +201,24 @@ export class BridgeSocket {
       if (err) {
         this.onStatus('连接失败，重试中');
         this.scheduleReconnect();
+        return;
       }
+      // 鸿蒙的 connect 回调就是"已连上"，open 事件不一定触发，两边都发一次 auth（重复无副作用）。
+      this.sendAuth();
     });
+  }
+
+  private sendAuth(): void {
+    const ws = this.ws;
+    if (ws === null) {
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: 'auth', token: this.token, deviceName: 'HOP-AL10' }));
+      this.startHeartbeat();
+    } catch (error) {
+      this.onStatus('鉴权发送失败');
+    }
   }
 
   private startHeartbeat(): void {
