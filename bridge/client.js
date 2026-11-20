@@ -36,32 +36,55 @@ window.__ModuleLoader__.load({
       return bases
     }
 
-    /** 逐个候选地址试；返回 {base, info, svg} 或 {error}，把失败原因原样带回来便于在面板上显示。 */
-    async function loadPairing() {
+    /** 找到第一个能应答的桥地址（桌面端页面来源是 dsh-app://app，只能挨个试）。 */
+    async function resolveBase() {
       const problems = []
       for (const base of candidateBases()) {
         const label = base === '' ? '同源' : base
         try {
-          const response = await fetch(`${base}/pair`)
-          if (!response.ok) {
-            problems.push(`${label} → HTTP ${response.status}`)
-            continue
-          }
-          const info = await response.json()
-          let svg = ''
-          try {
-            const svgResponse = await fetch(`${base}/pair.svg`)
-            if (svgResponse.ok) svg = await svgResponse.text()
-            else problems.push(`${label} /pair.svg → HTTP ${svgResponse.status}`)
-          } catch (error) {
-            problems.push(`${label} /pair.svg → ${error?.message ?? error}`)
-          }
-          return { base, info, svg }
+          const response = await fetch(`${base}/health`, { cache: 'no-store' })
+          if (response.ok) return { base, problems }
+          problems.push(`${label} → HTTP ${response.status}`)
         } catch (error) {
           problems.push(`${label} → ${error?.message ?? error}`)
         }
       }
-      return { error: problems.join('；') || 'unknown' }
+      return { base: '', problems }
+    }
+
+    /** 生成二维码前先体检：局域网、反代、隧道三段都通了才给码。 */
+    async function runDiagnostics() {
+      const resolved = await resolveBase()
+      if (!resolved.base) return { ok: false, checks: [], error: resolved.problems.join('；') || '找不到桥服务' }
+      try {
+        const response = await fetch(`${resolved.base}/pair/test`, { cache: 'no-store' })
+        if (!response.ok) {
+          return { ok: false, checks: [], error: `体检接口 HTTP ${response.status}` }
+        }
+        const result = await response.json()
+        return { ...result, base: resolved.base }
+      } catch (error) {
+        return { ok: false, checks: [], error: `体检失败：${error?.message ?? error}` }
+      }
+    }
+
+    /** 体检通过后才取二维码。 */
+    async function loadPairing(base) {
+      try {
+        const response = await fetch(`${base}/pair`, { cache: 'no-store' })
+        if (!response.ok) return { error: `/pair → HTTP ${response.status}` }
+        const info = await response.json()
+        let svg = ''
+        try {
+          const svgResponse = await fetch(`${base}/pair.svg`, { cache: 'no-store' })
+          if (svgResponse.ok) svg = await svgResponse.text()
+        } catch {
+          svg = ''
+        }
+        return { base, info, svg }
+      } catch (error) {
+        return { error: `/pair → ${error?.message ?? error}` }
+      }
     }
 
     // 面板开关状态：侧栏按钮和浮层两个槽位共享。
@@ -110,10 +133,35 @@ window.__ModuleLoader__.load({
       }, h(QrIcon, { size: 17 }))
     }
 
+    const CHECK_HINTS = ['桥服务', 'DSH 反代', '局域网可达', '隧道 → 桥', '隧道 → DSH']
+
+    function CheckRow({ name, ok, ms, detail }) {
+      return h('div', {
+        style: {
+          display: 'flex', alignItems: 'flex-start', gap: 8, padding: '3px 0',
+          fontSize: 12, lineHeight: 1.45,
+        },
+      },
+        h('span', {
+          style: {
+            flex: 'none', width: 14, textAlign: 'center',
+            color: ok === undefined ? '#9ca3af' : ok ? '#16a34a' : '#dc2626',
+            fontWeight: 700,
+          },
+        }, ok === undefined ? '·' : ok ? '✓' : '✗'),
+        h('div', { style: { flex: 1, minWidth: 0 } },
+          h('span', { style: { color: '#111827' } }, name),
+          typeof ms === 'number' && ms > 0 ? h('span', { style: { color: '#9ca3af' } }, ` · ${ms}ms`) : null,
+          detail ? h('div', { style: { color: '#6b7280', wordBreak: 'break-all' } }, detail) : null,
+        ),
+      )
+    }
+
     function PairOverlay() {
       const isOpen = useOpen()
       const [state, setState] = React.useState({ phase: 'idle' })
       const [copied, setCopied] = React.useState(false)
+      const [attempt, setAttempt] = React.useState(0)
 
       React.useEffect(() => {
         if (!isOpen) {
@@ -121,22 +169,32 @@ window.__ModuleLoader__.load({
           return undefined
         }
         let alive = true
-        setState({ phase: 'loading' })
-        loadPairing().then((result) => {
+        setState({ phase: 'testing' })
+        runDiagnostics().then(async (diag) => {
           if (!alive) return
-          setState(result.error ? { phase: 'error', message: result.error } : { phase: 'ok', ...result })
+          if (!diag.ok) {
+            setState({ phase: 'failed', diag })
+            return
+          }
+          const pair = await loadPairing(diag.base)
+          if (!alive) return
+          if (pair.error) {
+            setState({ phase: 'failed', diag, error: pair.error })
+            return
+          }
+          setState({ phase: 'ready', diag, pair })
         })
         return () => { alive = false }
-      }, [isOpen])
+      }, [isOpen, attempt])
 
       if (!isOpen) return null
 
-      const info = state.phase === 'ok' ? state.info : null
-      const svg = state.phase === 'ok' ? state.svg : ''
-      const base = state.phase === 'ok' ? state.base : ''
-      const lan = info?.base ?? ''
-      const wan = info?.public?.base ?? ''
-      const payload = info?.payload ?? ''
+      const diag = state.diag ?? null
+      const checks = diag?.checks ?? []
+      const pair = state.phase === 'ready' ? state.pair : null
+      const payload = pair?.info?.payload ?? ''
+      const lan = diag?.lan ?? ''
+      const tunnel = diag?.tunnel ?? ''
       const origin = typeof window !== 'undefined' ? window.location.origin : ''
 
       const copy = () => {
@@ -147,43 +205,49 @@ window.__ModuleLoader__.load({
         }).catch(() => setCopied(false))
       }
 
-      const body = []
-      if (state.phase === 'loading') {
-        body.push(h('div', {
-          key: 'loading',
-          style: {
-            width: 224, height: 224, display: 'flex', alignItems: 'center',
-            justifyContent: 'center', color: '#6b7280', fontSize: 13,
-          },
-        }, '正在读取二维码…'))
-      } else if (state.phase === 'error') {
-        body.push(h('div', {
-          key: 'error',
-          style: {
-            width: 224, minHeight: 120, display: 'flex', flexDirection: 'column',
-            gap: 6, justifyContent: 'center', color: '#b91c1c', fontSize: 12,
-            lineHeight: 1.5, wordBreak: 'break-all',
-          },
-        },
-          h('div', null, '取二维码失败'),
-          h('div', { style: { color: '#6b7280' } }, state.message),
-          h('div', { style: { color: '#9ca3af' } }, `页面来源：${origin}`),
-        ))
-      } else if (svg) {
-        body.push(h('img', {
-          key: 'qr',
-          src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`,
-          width: 224, height: 224, alt: '配对二维码',
-          style: { display: 'block', borderRadius: 8, background: '#fff' },
-        }))
+      const rows = []
+      if (state.phase === 'testing') {
+        for (const name of CHECK_HINTS) rows.push(h(CheckRow, { key: name, name, ok: undefined, ms: 0, detail: '检测中…' }))
       } else {
-        // 拿不到 SVG 文本时退回让浏览器直接加载图片：<img> 不受 CORS 限制，只要能连通就能出图。
-        body.push(h('img', {
-          key: 'qr-img',
-          src: `${base}/pair.svg?ts=${Date.now()}`,
-          width: 224, height: 224, alt: '配对二维码',
-          style: { display: 'block', borderRadius: 8, background: '#fff' },
-        }))
+        for (const check of checks) rows.push(h(CheckRow, { key: check.name, ...check }))
+      }
+      if (diag?.error) rows.push(h('div', { key: 'diag-error', style: { color: '#b91c1c', fontSize: 12, marginTop: 6, wordBreak: 'break-all' } }, diag.error))
+      if (state.error) rows.push(h('div', { key: 'pair-error', style: { color: '#b91c1c', fontSize: 12, marginTop: 6, wordBreak: 'break-all' } }, state.error))
+
+      const qrBox = []
+      if (state.phase === 'ready') {
+        if (pair.svg) {
+          qrBox.push(h('img', {
+            key: 'qr',
+            src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(pair.svg)}`,
+            width: 216, height: 216, alt: '配对二维码',
+            style: { display: 'block', borderRadius: 8, background: '#fff' },
+          }))
+        } else {
+          qrBox.push(h('img', {
+            key: 'qr-img',
+            src: `${diag.base}/pair.svg?ts=${Date.now()}`,
+            width: 216, height: 216, alt: '配对二维码',
+            style: { display: 'block', borderRadius: 8, background: '#fff' },
+          }))
+        }
+      } else if (state.phase === 'testing') {
+        qrBox.push(h('div', {
+          key: 'qr-loading',
+          style: {
+            width: 216, height: 216, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: '#6b7280', fontSize: 13, border: '1px dashed #d1d5db', borderRadius: 12,
+          },
+        }, '正在测试环境…'))
+      } else {
+        qrBox.push(h('div', {
+          key: 'qr-blocked',
+          style: {
+            width: 216, minHeight: 96, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: '#b91c1c', fontSize: 12, textAlign: 'center', lineHeight: 1.5,
+            border: '1px dashed #fca5a5', borderRadius: 12, padding: 12, boxSizing: 'border-box',
+          },
+        }, '环境没通过测试，先不出码'))
       }
 
       const panel = h('div', {
@@ -196,7 +260,7 @@ window.__ModuleLoader__.load({
       }, h('div', {
         onClick: (event) => event.stopPropagation(),
         style: {
-          width: 340, maxWidth: '92vw', padding: 22, borderRadius: 16,
+          width: 356, maxWidth: '93vw', padding: 22, borderRadius: 16,
           background: '#ffffff', color: '#111827',
           boxShadow: '0 24px 60px rgba(0,0,0,0.35)', fontFamily: 'inherit',
         },
@@ -211,33 +275,42 @@ window.__ModuleLoader__.load({
             },
           }, '×'),
         ),
-        h('div', { style: { marginTop: 10, background: '#fff', display: 'flex', justifyContent: 'center' } }, body),
-        h('div', { style: { marginTop: 12, fontSize: 12, color: '#4b5563' } },
-          lan ? `局域网：${lan}` : '局域网：未就绪',
-        ),
-        h('div', { style: { marginTop: 2, fontSize: 12, color: '#4b5563' } },
-          wan ? `公网：${wan}` : '公网：未设置（出门在外需要先起隧道）',
-        ),
+        h('div', {
+          style: {
+            marginTop: 12, padding: '10px 12px', borderRadius: 10,
+            background: '#f8fafc', border: '1px solid #e5e7eb',
+          },
+        }, rows),
+        h('div', { style: { marginTop: 14, display: 'flex', justifyContent: 'center' } }, qrBox),
+        state.phase === 'ready'
+          ? h('div', { style: { marginTop: 10, fontSize: 12, color: '#4b5563', textAlign: 'center' } },
+            tunnel ? `手机扫码即可（同一 Wi-Fi 直连，出门走隧道）` : '手机扫码即可（仅同一 Wi-Fi 可用）')
+          : null,
+        state.phase === 'ready'
+          ? h('div', { style: { marginTop: 4, fontSize: 11, color: '#9ca3af', textAlign: 'center', wordBreak: 'break-all' } },
+            [lan, tunnel].filter(Boolean).join('  |  '))
+          : h('div', { style: { marginTop: 4, fontSize: 11, color: '#9ca3af', textAlign: 'center' } },
+            `页面来源：${origin}`),
         h('div', { style: { marginTop: 14, display: 'flex', gap: 8 } },
+          h('button', {
+            type: 'button',
+            onClick: () => setAttempt((value) => value + 1),
+            style: {
+              flex: 1, padding: '9px 12px', borderRadius: 9, border: '1px solid #d1d5db',
+              background: '#f9fafb', color: '#111827', fontSize: 13, cursor: 'pointer',
+            },
+          }, '重新测试'),
           h('button', {
             type: 'button', onClick: copy, disabled: !payload,
             style: {
-              flex: 1, padding: '9px 12px', borderRadius: 9, border: '1px solid #d1d5db',
-              background: copied ? '#dcfce7' : '#f9fafb', color: '#111827',
+              flex: 1, padding: '9px 12px', borderRadius: 9, border: 'none',
+              background: payload ? '#2563eb' : '#c7d2fe', color: '#fff',
               fontSize: 13, cursor: payload ? 'pointer' : 'default',
             },
           }, copied ? '已复制' : '复制配对链接'),
-          h('button', {
-            type: 'button',
-            onClick: () => window.open(`${base}/pair.svg`, '_blank'),
-            style: {
-              flex: 1, padding: '9px 12px', borderRadius: 9, border: 'none',
-              background: '#2563eb', color: '#fff', fontSize: 13, cursor: 'pointer',
-            },
-          }, '单独打开'),
         ),
         h('div', { style: { marginTop: 10, fontSize: 11, color: '#9ca3af', lineHeight: 1.5 } },
-          '手机 App 首页 →「扫一扫」→ 对准屏幕。扫完自动填好地址与令牌，直接进入 DSH。',
+          '手机 App：没连接过会自动进入扫码页，扫完直接进 DSH；右上角只有设置入口。',
         ),
       ))
 

@@ -260,6 +260,67 @@ export function apply(ctx, config) {
     return { name: os.hostname(), lan, lanAll, public: pub, target, payload }
   }
 
+  /** 单个 HTTP 探测：2xx/3xx/401 都算"通了"（401 说明 DSH 在跑，只是还没登录）。 */
+  function probe(urlString, name) {
+    return new Promise((resolve) => {
+      const started = Date.now()
+      const done = (ok, detail) => resolve({ name, ok, ms: Date.now() - started, detail })
+      try {
+        const target = new URL(urlString)
+        const secure = target.protocol === 'https:'
+        const request = (secure ? https : http).request({
+          host: target.hostname,
+          port: target.port ? Number(target.port) : (secure ? 443 : 80),
+          path: `${target.pathname}${target.search}`,
+          method: 'GET',
+          timeout: 8000,
+          headers: { host: target.host, accept: 'application/json,text/html' },
+        }, (response) => {
+          let body = ''
+          response.setEncoding('utf8')
+          response.on('data', (chunk) => { body += chunk })
+          response.on('end', () => {
+            const status = response.statusCode ?? 0
+            const ok = (status >= 200 && status < 400) || status === 401
+            const head = body.replace(/\s+/g, ' ').slice(0, 48)
+            done(ok, `HTTP ${status}${head ? ` · ${head}` : ''}`)
+          })
+        })
+        request.on('timeout', () => { request.destroy(); done(false, '超时') })
+        request.on('error', (error) => done(false, error?.code ?? String(error?.message ?? error)))
+        request.end()
+      } catch (error) {
+        done(false, String(error?.message ?? error))
+      }
+    })
+  }
+
+  /** 配对前的体检：桥本身、反代、局域网、隧道 → 桥、隧道 → DSH。 */
+  async function pairTest() {
+    const info = pairing('127.0.0.1')
+    const checks = []
+    checks.push(await probe(`http://127.0.0.1:${options.port}/health`, '桥服务'))
+    checks.push(await probe(`http://127.0.0.1:${options.proxyPort}/`, 'DSH 反代'))
+    const lanHost = (() => {
+      try { return new URL(info.lan.base).host } catch { return '' }
+    })()
+    if (lanHost) checks.push(await probe(`http://${lanHost}/health`, '局域网可达'))
+    if (info.public) {
+      checks.push(await probe(`${info.public.base}/health`, '隧道 → 桥'))
+      checks.push(await probe(`${info.public.base}/`, '隧道 → DSH'))
+    } else {
+      checks.push({ name: '隧道', ok: false, ms: 0, detail: '未启用（config.tunnel 设为 auto 后重启 Desktop）' })
+    }
+    return {
+      ok: checks.every((check) => check.ok),
+      checks,
+      lan: info.lan.base,
+      tunnel: info.public ? info.public.base : '',
+      proxyPort: options.proxyPort,
+      at: Date.now(),
+    }
+  }
+
   /** 手机扫码/自动发现后要能连上，这里统一给一份 JSON。 */
   function pairingJson(hostHeader) {
     const info = pairing(hostHeader)
@@ -664,6 +725,28 @@ export function apply(ctx, config) {
         'access-control-allow-origin': '*',
       })
       response.end(JSON.stringify(pairingJson(host)))
+      return
+    }
+
+    if (url.pathname === '/pair/test') {
+      // 面板在生成二维码之前先跑一遍体检：局域网 / 反代 / 隧道三段都通了才出码。
+      const host = String(request.headers.host ?? '')
+      if (looksPublic(host) && url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      pairTest().then((result) => {
+        response.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+        })
+        response.end(JSON.stringify(result))
+      }).catch((error) => {
+        response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, checks: [], error: String(error?.message ?? error) }))
+      })
       return
     }
 

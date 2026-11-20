@@ -8,6 +8,13 @@ import { Discovery, FoundHost } from '../common/Discovery';
 import { Notifier } from '../common/Notifier';
 import { applyPairing, parsePairing, PairResult } from '../common/Pairing';
 
+/**
+ * 三段式界面：
+ *   scan     —— 没配对过：只放一个「扫码连接电脑」和备用入口
+ *   main     —— 已配对：全屏 DSH，右上角只有一枚设置按钮
+ *   settings —— 手动改地址 / 重新扫码 / 看连接测试结果
+ * 连接状态、隧道、令牌这些细节都不在主界面出现，出错才回到设置页显示原因。
+ */
 @Entry
 @Component
 struct Index {
@@ -16,7 +23,6 @@ struct Index {
   @State portInput: string = '3088';
   @State tokenInput: string = '';
   @State tunnelInput: string = '';
-  @State statusText: string = '未连接';
   @State testResult: string = '';
   @State busy: boolean = false;
   @State webUrl: string = '';
@@ -38,7 +44,7 @@ struct Index {
       this.found = host;
       this.foundName = host.name;
       this.hasFound = true;
-      this.testResult = `发现电脑：${host.name}，点「连接」即可`;
+      this.testResult = `发现电脑：${host.name}`;
     };
     this.discovery.onError = (message: string) => {
       this.foundName = message;
@@ -50,13 +56,11 @@ struct Index {
       this.portInput = `${loaded.port}`;
       this.tokenInput = loaded.token;
       this.tunnelInput = loaded.tunnel;
-      // 冷启动时系统相机直接把 dshremote:// 链接交给本应用：此时 @Watch 不会触发，
-      // 必须在这里主动消费一次，否则会沿用 preferences 里的旧地址。
+      // 冷启动时系统相机把 dshremote:// 链接直接交给本应用：@Watch 不会触发，得在这里主动消费。
       const pending = AppStorage.get<string>('pairUri') ?? '';
       if (pending.length > 0) {
         AppStorage.setOrCreate<string>('pairUri', '');
         this.pairUri = '';
-        this.stage = 'setup';
         this.applyPairText(pending);
         return;
       }
@@ -64,7 +68,7 @@ struct Index {
         this.stage = 'main';
         await this.enterMain();
       } else {
-        this.stage = 'setup';
+        this.stage = 'scan';
         this.discovery.start();
       }
     });
@@ -88,33 +92,32 @@ struct Index {
     return cfg;
   }
 
+  /** 设置页里的「测试连接」。 */
   private async testConnection(): Promise<void> {
     this.busy = true;
     const cfg = this.readForm();
-    this.testResult = await BridgeHttp.health(cfg.baseUrl());
+    this.cfg = cfg;
+    await this.pickTransport();
+    this.testResult = await BridgeHttp.health(this.cfg.baseUrl());
     this.busy = false;
   }
 
+  /** 设置页里的「保存并进入」。 */
   private async saveAndEnter(): Promise<void> {
     const cfg = this.readForm();
     if (!cfg.valid()) {
-      this.testResult = 'IP、端口、token 都要填';
+      this.testResult = '地址和令牌都要填，扫码通常会自动填好';
       return;
     }
     this.busy = true;
     this.cfg = cfg;
-    // 先把"走局域网还是走隧道"定下来：出门在外时局域网必然超时，
-    // 直接拿局域网地址去探测就会卡 5 秒再报 Operation timeout。
     await this.pickTransport();
     const health = await BridgeHttp.health(this.cfg.baseUrl());
-    hilog.info(0x0000, 'dshremote', '保存并进入 base=%{public}s health=%{public}s',
-      this.cfg.baseUrl(), health);
+    hilog.info(0x0000, 'dshremote', '保存并进入 base=%{public}s health=%{public}s', this.cfg.baseUrl(), health);
     if (!health.startsWith('桥')) {
       this.testResult = health;
       this.busy = false;
-      if (this.stage !== 'main') {
-        this.stage = 'setup';
-      }
+      this.stage = 'settings';
       return;
     }
     await ConfigStore.save(this.cfg);
@@ -138,7 +141,7 @@ struct Index {
     const result: PairResult = parsePairing(raw);
     if (!result.ok) {
       this.testResult = result.error;
-      hilog.error(0x0000, 'dshremote', '配对码解析失败：%{public}s', result.error);
+      this.stage = 'scan';
       return;
     }
     const cfg = this.readForm();
@@ -149,8 +152,6 @@ struct Index {
     this.tokenInput = cfg.token;
     this.tunnelInput = cfg.tunnel;
     this.testResult = `已配对：${result.name}`;
-    hilog.info(0x0000, 'dshremote', '配对生效 host=%{public}s tunnel=%{public}s',
-      cfg.host, cfg.tunnel);
     this.saveAndEnter();
   }
 
@@ -180,14 +181,13 @@ struct Index {
     const webPort = Number(this.found.web.split(':').pop());
     cfg.proxyPort = Number.isFinite(webPort) && webPort > 0 ? webPort : 7627;
     cfg.token = this.found.token;
-    // 自动发现时顺手把电脑的公网地址也存下来：在家连一次，出门就能自动切隧道。
     cfg.tunnel = this.found.publicUrl.length > 0 ? this.found.publicUrl : '';
     this.cfg = cfg;
     this.hostInput = cfg.host;
     this.portInput = `${cfg.port}`;
     this.tokenInput = cfg.token;
     this.tunnelInput = cfg.tunnel;
-    this.testResult = `连接 ${this.found.name}…`;
+    this.discovery.stop();
     await this.saveAndEnter();
   }
 
@@ -202,7 +202,6 @@ struct Index {
     const probe = await BridgeHttp.health(this.cfg.lanBase(), 2000);
     const lanAlive = probe.startsWith('桥 ');
     if (lanAlive) {
-      // 局域网通的时候顺手问一下桥现在的公网地址：电脑重启后隧道地址会变，这里自愈。
       const tunnel = await BridgeHttp.pairInfo(this.cfg.lanBase());
       if (tunnel.length > 0 && tunnel !== this.cfg.tunnel) {
         this.cfg.tunnel = tunnel;
@@ -211,185 +210,265 @@ struct Index {
       this.cfg.preferTunnel = false;
     } else if (this.cfg.tunnelUrl().length > 0) {
       this.cfg.preferTunnel = true;
-      this.statusText = '局域网连不上，改走隧道…';
     }
     await ConfigStore.save(this.cfg);
   }
 
   private async enterMain(): Promise<void> {
     await this.pickTransport();
-    const lanBase = this.cfg.webUrl();
+    const base = this.cfg.webUrl();
     this.webReady = false;
     this.discovery.stop();
-    this.poller.onStatus = (text: string) => {
-      this.statusText = text;
+    this.poller.onStatus = () => {
+      // 主界面不展示连接细节，状态只留在内部。
     };
     this.poller.onTurnEnd = (event: TurnEndEvent) => {
-      const title = event.sessionTitle.length > 0 ? event.sessionTitle : '会话';
-      this.statusText = `回合结束 · ${title}`;
+      const title = event.sessionTitle.length > 0 ? event.sessionTitle : 'DSH';
       const head = event.answerHead.length > 0 ? event.answerHead : event.question;
-      Notifier.publish(`${title} · ${event.status}`, head).then((reason: string) => {
-        if (reason.length > 0) {
-          this.statusText = `回合结束 · 通知失败：${reason}`;
-        }
-      });
+      Notifier.publish(`${title} · ${event.status}`, head);
     };
     this.poller.start(this.cfg.baseUrl(), this.cfg.token);
-    // 走隧道时先把公网域名登记进 DSH 的 trustedHosts，否则页面里的 /api 会 403。
     const tunnel = this.cfg.tunnelUrl();
     if (tunnel.length > 0) {
       const authority = tunnel.replace('https://', '').replace('http://', '').split('/')[0];
       await BridgeHttp.trust(this.cfg.baseUrl(), this.cfg.token, authority);
     }
-    // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
-    const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token, lanBase);
+    const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token, base);
     if (cookie.length > 0) {
       try {
-        webview.WebCookieManager.configCookieSync(lanBase, cookie);
+        webview.WebCookieManager.configCookieSync(base, cookie);
       } catch (error) {
-        this.statusText = '写登录 cookie 失败';
+        hilog.error(0x0000, 'dshremote', '写 cookie 失败');
       }
     }
-    this.statusText = cookie.length > 0 ? '正在打开 DSH…' : '未取得登录 cookie';
-    // cookie 写好之后再挂 Web 组件，避免先加载出 401 页面。
-    this.webUrl = lanBase;
+    this.webUrl = base;
     this.webReady = true;
   }
 
-  @Builder
-  setupView() {
-    Column({ space: 14 }) {
-      Text('连接你的电脑').fontSize(26).fontWeight(FontWeight.Bold)
-      Text('先在电脑上装好 dshremote-bridge 插件，用「扫一扫」或「自动发现」配对，也可以手动填')
-        .fontSize(13)
-        .fontColor('#666666')
-        .textAlign(TextAlign.Center)
-        .padding({ left: 24, right: 24 })
+  private openSettings(): void {
+    this.stage = 'settings';
+  }
 
-      Row({ space: 12 }) {
-        Button('扫一扫配对')
-          .enabled(!this.busy)
-          .onClick(() => {
-            this.scanPair();
-          })
-        Button(this.hasFound ? `连接 ${this.foundName}` : '自动发现')
-          .enabled(!this.busy)
-          .onClick(() => {
-            if (this.hasFound) {
-              this.connectFound();
-            } else {
-              this.testResult = '正在搜索同一 Wi-Fi 下的电脑…';
-              this.discovery.start();
-            }
-          })
-      }
-
-      TextInput({ placeholder: '电脑 IP，例如 192.168.68.225', text: this.hostInput })
-        .onChange((value: string) => {
-          this.hostInput = value;
-        })
-        .width('100%')
-
-      TextInput({ placeholder: '端口，默认 3088', text: this.portInput })
-        .type(InputType.Number)
-        .onChange((value: string) => {
-          this.portInput = value;
-        })
-        .width('100%')
-
-      TextInput({ placeholder: '配对 token', text: this.tokenInput })
-        .onChange((value: string) => {
-          this.tokenInput = value;
-        })
-        .width('100%')
-
-      TextInput({ placeholder: '隧道地址（可选，https://xxx.trycloudflare.com）', text: this.tunnelInput })
-        .onChange((value: string) => {
-          this.tunnelInput = value;
-        })
-        .width('100%')
-
-      Row({ space: 12 }) {
-        Button('测试连接')
-          .enabled(!this.busy)
-          .onClick(() => {
-            this.testConnection();
-          })
-        Button('保存并进入')
-          .enabled(!this.busy)
-          .onClick(() => {
-            this.saveAndEnter();
-          })
-      }
-
-      if (this.testResult.length > 0) {
-        Text(this.testResult).fontSize(13).fontColor('#0a7').textAlign(TextAlign.Center)
-      }
-
-      Text('v0.1.0 · 需要电脑端 dshremote-bridge 插件')
-        .fontSize(11)
-        .fontColor('#999999')
-        .margin({ top: 8 })
+  private closeSettings(): void {
+    this.testResult = '';
+    this.stage = this.cfg.valid() ? 'main' : 'scan';
+    if (this.stage === 'scan') {
+      this.discovery.start();
     }
-    .padding({ left: 24, right: 24 })
+  }
+
+  build() {
+    Stack() {
+      if (this.stage === 'main') {
+        this.mainView()
+      } else if (this.stage === 'settings') {
+        this.settingsView()
+      } else if (this.stage === 'scan') {
+        this.scanView()
+      } else {
+        this.loadingView()
+      }
+    }
     .width('100%')
+    .height('100%')
+    .backgroundColor('#FFFFFF')
+  }
+
+  @Builder
+  loadingView() {
+    Column({ space: 12 }) {
+      LoadingProgress().width(48).height(48)
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  scanView() {
+    Column({ space: 18 }) {
+      Blank().layoutWeight(1)
+      Text('DSH Remote').fontSize(30).fontWeight(FontWeight.Bold)
+      Text('用手机操控电脑上的 DeepSeek Harness')
+        .fontSize(14)
+        .fontColor('#666666')
+      Blank().height(12)
+      Button('扫码连接电脑')
+        .width(220)
+        .height(48)
+        .fontSize(16)
+        .onClick(() => {
+          this.scanPair();
+        })
+      if (this.hasFound) {
+        Button(`连接 ${this.foundName}`)
+          .width(220)
+          .height(42)
+          .fontSize(14)
+          .backgroundColor('#EEF2FF')
+          .fontColor('#1D4ED8')
+          .onClick(() => {
+            this.connectFound();
+          })
+      } else {
+        Button('自动发现电脑')
+          .width(220)
+          .height(42)
+          .fontSize(14)
+          .backgroundColor('#F3F4F6')
+          .fontColor('#374151')
+          .onClick(() => {
+            this.testResult = '';
+            this.discovery.start();
+          })
+      }
+      if (this.testResult.length > 0) {
+        Text(this.testResult)
+          .fontSize(12)
+          .fontColor('#B91C1C')
+          .textAlign(TextAlign.Center)
+          .padding({ left: 32, right: 32 })
+      }
+      Button('手动设置地址')
+        .backgroundColor(Color.Transparent)
+        .fontColor('#6B7280')
+        .fontSize(13)
+        .onClick(() => {
+          this.stage = 'settings';
+        })
+      Blank().layoutWeight(1)
+      Text('在同一 Wi-Fi 或电脑已开隧道时可用')
+        .fontSize(11)
+        .fontColor('#9CA3AF')
+        .margin({ bottom: 24 })
+    }
+    .width('100%')
+    .height('100%')
     .justifyContent(FlexAlign.Center)
   }
 
   @Builder
   mainView() {
-    Column() {
-      Row({ space: 8 }) {
-        Text(this.statusText).fontSize(13).fontColor('#666666').layoutWeight(1)
-        Button('刷新')
-          .buttonStyle(ButtonStyleMode.TEXTUAL)
-          .onClick(() => {
-            this.controller.refresh();
-          })
-        Button('设置')
-          .buttonStyle(ButtonStyleMode.TEXTUAL)
-          .onClick(() => {
-            this.poller.stop();
-            this.statusText = '已断开';
-            this.stage = 'setup';
-            this.discovery.start();
-          })
-      }
-      .width('100%')
-      .padding({ left: 12, right: 12, top: 4, bottom: 4 })
-
+    Stack({ alignContent: Alignment.TopEnd }) {
       if (this.webReady) {
         Web({ src: this.webUrl, controller: this.controller })
           .domStorageAccess(true)
           .fileAccess(false)
+          .darkMode(WebDarkMode.Auto)
           .width('100%')
-          .layoutWeight(1)
-          .onPageEnd(() => {
-            this.statusText = 'DSH 已加载 · 等待回合结束';
-          })
+          .height('100%')
       } else {
         Column({ space: 10 }) {
-          LoadingProgress().width(48).height(48)
-          Text(this.statusText).fontSize(13).fontColor('#888888')
+          LoadingProgress().width(40).height(40)
         }
         .width('100%')
-        .layoutWeight(1)
+        .height('100%')
         .justifyContent(FlexAlign.Center)
       }
+      Button() {
+        SymbolGlyph($r('sys.symbol.gearshape'))
+          .fontSize(18)
+          .fontColor(['#4B5563'])
+      }
+      .width(34)
+      .height(34)
+      .backgroundColor('#F2FFFFFF')
+      .borderRadius(17)
+      .border({ width: 1, color: '#1F000000' })
+      .margin({ top: 46, right: 10 })
+      .onClick(() => {
+        this.openSettings();
+      })
     }
     .width('100%')
     .height('100%')
   }
 
-  build() {
+  @Builder
+  settingsView() {
     Column() {
-      if (this.stage === 'main') {
-        this.mainView()
-      } else if (this.stage === 'setup') {
-        this.setupView()
-      } else {
-        Text('正在读取配置…').fontSize(14).fontColor('#888888')
+      Row({ space: 8 }) {
+        Button('返回')
+          .fontSize(14)
+          .backgroundColor(Color.Transparent)
+          .fontColor('#2563EB')
+          .onClick(() => {
+            this.closeSettings();
+          })
+        Blank()
+        Text('设置').fontSize(17).fontWeight(FontWeight.Medium)
+        Blank()
+        Button('').width(48).backgroundColor(Color.Transparent)
       }
+      .width('100%')
+      .padding({ left: 8, right: 8, top: 8 })
+
+      Scroll() {
+        Column({ space: 12 }) {
+          Button('扫码重新配对')
+            .width('100%')
+            .height(44)
+            .onClick(() => {
+              this.scanPair();
+            })
+
+          TextInput({ text: this.hostInput, placeholder: '电脑 IP 或主机名' })
+            .height(44)
+            .onChange((value: string) => {
+              this.hostInput = value;
+            })
+          TextInput({ text: this.portInput, placeholder: '端口 3088' })
+            .height(44)
+            .type(InputType.Number)
+            .onChange((value: string) => {
+              this.portInput = value;
+            })
+          TextInput({ text: this.tokenInput, placeholder: '配对令牌' })
+            .height(44)
+            .onChange((value: string) => {
+              this.tokenInput = value;
+            })
+          TextInput({ text: this.tunnelInput, placeholder: '隧道地址（可选，https://…）' })
+            .height(44)
+            .onChange((value: string) => {
+              this.tunnelInput = value;
+            })
+
+          Row({ space: 10 }) {
+            Button('测试连接')
+              .layoutWeight(1)
+              .height(44)
+              .enabled(!this.busy)
+              .backgroundColor('#F3F4F6')
+              .fontColor('#111827')
+              .onClick(() => {
+                this.testConnection();
+              })
+            Button('保存并进入')
+              .layoutWeight(1)
+              .height(44)
+              .enabled(!this.busy)
+              .onClick(() => {
+                this.saveAndEnter();
+              })
+          }
+
+          if (this.testResult.length > 0) {
+            Text(this.testResult)
+              .fontSize(12)
+              .fontColor(this.testResult.startsWith('桥 ') ? '#15803D' : '#B91C1C')
+              .width('100%')
+          }
+        }
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 8, bottom: 20 })
+      }
+      .layoutWeight(1)
+
+      Text('v0.2.0 · 电脑端需要 dshremote-bridge 插件')
+        .fontSize(11)
+        .fontColor('#9CA3AF')
+        .margin({ bottom: 18 })
     }
     .width('100%')
     .height('100%')
