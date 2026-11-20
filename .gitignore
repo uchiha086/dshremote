@@ -35,3 +35,6 @@ bridge/test/*.log
 bridge/test/*.token
 bridge/test/*.hosts
 android/*.idsig
+
+# 自测临时目录
+/test/
