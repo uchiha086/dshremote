@@ -59,24 +59,22 @@ DSH 是个桌面版 Agent，人离开了电脑就没法盯进度。现有的远�
         局域网：http://<pc-ip>:7627        公网：https://xxx.trycloudflare.com
 ```
 
-## 获取方式：只发源码，不发二进制
+## 获取方式
 
-本仓库**不提供预编译的 HAP / APK**，请自行构建（或按下方说明签名）。原因很实在：
+**安卓**：直接下载 [`dshremote-android-0.2.0.apk`](https://github.com/uchiha086/dshremote/releases/tag/v0.2.0-android)（41 KB，Android 7.0+，全平台通用，v2/v3 签名）。
 
-- 鸿蒙包用的是**开发签名**，证书绑定了签名人自己的设备 UDID（`debug-info.device-ids` 只有一台），换设备、换人一律装不上，发出来对别人没有意义；
-- 安卓包是 debug keystore 自签，谁都能装但也不该由我代发；
-- 想给别人用，正确做法是**各自用自己账号签名**，或走 AppGallery 正式分发。
+**鸿蒙**：只发源码。因为开发签名会把证书绑定在签名人自己的设备 UDID 上（`.p7b` 里 `debug-info.device-ids` 只有一台），别人下载了也装不上——所以请按 [docs/使用与签名.md](docs/使用与签名.md) 用你自己的华为账号签名后构建。
 
-三步走：
+**电脑端插件**：同样从源码装。
 
 ```powershell
 git clone https://github.com/uchiha086/dshremote.git
 cd dshremote
-# 1) 电脑端插件：把 bridge/ 装进 DSH profile，重启 Desktop
-# 2) 手机端：见下节「自己构建」
+# 1) 把 bridge/ 装进 DSH profile（对 Agent 说一句「用 plugin_manager 装这个目录」），重启 Desktop
+# 2) 手机端：安卓直接装 APK；鸿蒙按 docs/使用与签名.md 构建并签名
 ```
 
-> 完整的安装、构建、签名（鸿蒙 + 安卓）、常见故障处理：**[docs/使用与签名.md](docs/使用与签名.md)**
+> 完整步骤、签名细节、故障排查：**[docs/使用与签名.md](docs/使用与签名.md)**
 
 ## 三步开始
 
