@@ -6,6 +6,8 @@
  */
 import assert from 'node:assert'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 import net from 'node:net'
 import { apply } from '../lib/index.mjs'
 
@@ -43,9 +45,9 @@ apply(ctx, {
   proxyEnabled: false,
   proxyPort: 39103,
   upstreamPort: UPSTREAM_PORT,
-  logFile: 'test/proxy.log',
-  tokenFile: 'test/proxy.token',
-  hostsFile: 'test/proxy.hosts',
+  logFile: path.join(os.tmpdir(), 'dshremote-proxy.log'),
+  tokenFile: path.join(os.tmpdir(), 'dshremote-proxy.token'),
+  hostsFile: path.join(os.tmpdir(), 'dshremote-proxy.hosts'),
 })
 
 await new Promise((resolve) => setTimeout(resolve, 500))
