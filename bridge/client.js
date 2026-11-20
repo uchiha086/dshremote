@@ -190,6 +190,20 @@ window.__ModuleLoader__.load({
         return () => { alive = false }
       }, [isOpen, attempt])
 
+      // 二维码里是 60 秒一次性码，面板开着就得自己换新的，否则用户磨蹭一下扫到的就是废码。
+      React.useEffect(() => {
+        if (!isOpen || state.phase !== 'ready') return undefined
+        const diag = state.diag
+        const root = `${diag?.base ?? ''}${diag?.prefix ?? ''}`
+        let alive = true
+        const timer = setInterval(async () => {
+          const pair = await loadPairing(root)
+          if (!alive || pair.error) return
+          setState((prev) => (prev.phase === 'ready' ? { ...prev, pair } : prev))
+        }, 40 * 1000)
+        return () => { alive = false; clearInterval(timer) }
+      }, [isOpen, state.phase, state.diag])
+
       if (!isOpen) return null
 
       const diag = state.diag ?? null
@@ -292,6 +306,12 @@ window.__ModuleLoader__.load({
             border: '1px dashed #fca5a5', borderRadius: 12, padding: 12, boxSizing: 'border-box',
           },
         }, '环境没通过测试，先不出码'))
+      }
+      if (state.phase === 'ready') {
+        qrBox.push(h('div', {
+          key: 'qr-hint',
+          style: { width: 216, marginTop: 8, textAlign: 'center', fontSize: 11, color: '#6b7280', lineHeight: 1.4 },
+        }, '一次性码 60 秒过期，这里每 40 秒自动换新'))
       }
 
       const panel = h('div', {

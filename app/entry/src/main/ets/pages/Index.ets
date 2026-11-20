@@ -61,7 +61,13 @@ struct Index {
       if (pending.length > 0) {
         AppStorage.setOrCreate<string>('pairUri', '');
         this.pairUri = '';
-        this.applyPairText(pending);
+        // 冷启动也不能跳过确认：任何网页/应用都能发 dshremote:// 链接。
+        this.confirmPair(pending, () => {
+          this.stage = loaded.valid() ? 'main' : 'scan';
+          if (loaded.valid()) {
+            this.enterMain();
+          }
+        });
         return;
       }
       if (loaded.valid()) {
@@ -134,14 +140,23 @@ struct Index {
     const text = this.pairUri;
     this.pairUri = '';
     AppStorage.setOrCreate<string>('pairUri', '');
-    // 外来的深链不能直接连：任何 App/网页都能发 dshremote://，先让用户看一眼是不是自己的电脑。
+    this.confirmPair(text, () => { });
+  }
+
+  /** 外来的深链不能直接连：先让用户看一眼是不是自己的电脑。取消时走 onCancel。 */
+  private confirmPair(text: string, onCancel: () => void): void {
     const preview: PairResult = parsePairing(text);
     AlertDialog.show({
       title: '收到配对请求',
       message: preview.ok
         ? `来自「${preview.name}」的配对链接，确认连接这台电脑吗？`
         : `这个链接不是 DSH Remote 的配对码：${preview.error}`,
-      primaryButton: { value: '取消', action: () => { } },
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          onCancel();
+        }
+      },
       secondaryButton: {
         value: '连接',
         action: () => {
