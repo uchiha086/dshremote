@@ -1,0 +1,18 @@
+# dshremote-bridge：DSH Remote 的电脑端桥插件。
+# 用 `dsh plugin --profile desktop add -w <本目录>` 或 plugin_manager 的 install_bundle 装入后，
+# 由 profile 的 cordis 加载；同名覆盖会整体替换 config，改配置请直接改这里。
+- insert:
+    - id: dshremote-bridge
+      name: dshremote-bridge
+      config:
+        enabled: true
+        port: 3088
+        bind: 0.0.0.0
+        token: ''
+        proxyEnabled: true
+        proxyPort: 7627
+        upstreamHost: 127.0.0.1
+        upstreamPort: 7626
+        answerHeadChars: 120
+        questionChars: 200
+        logFile: ''
