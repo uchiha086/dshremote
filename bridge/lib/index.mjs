@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process'
 import { svgOf } from './qr.mjs'
 
 /** 桥插件版本，手机端据此判断兼容性。 */
-const BRIDGE_VERSION = '0.2.1'
+const BRIDGE_VERSION = '0.2.2'
 
 
 /** 最近事件最多留多少条，供 /events 调试与手机补拉。 */

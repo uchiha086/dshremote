@@ -166,7 +166,7 @@ public class MainActivity extends Activity {
         col.addView(connectBtn, connectLp);
 
         TextView foot = new TextView(this);
-        foot.setText("v0.2.1 · 电脑端需要 dshremote-bridge 插件");
+        foot.setText("v0.2.2 · 电脑端需要 dshremote-bridge 插件");
         foot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         foot.setTextColor(Color.rgb(160, 160, 160));
         foot.setGravity(Gravity.CENTER);        LinearLayout.LayoutParams footLp = matchWrap();
@@ -182,14 +182,22 @@ public class MainActivity extends Activity {
                 cfg.apply(link);
                 // v2 二维码里只有 60 秒一次性码：真正连之前先换成 token。
                 if (link.token.isEmpty() && !link.code.isEmpty()) {
-                    String claimBase = !link.base.isEmpty() ? link.base : link.tunnel;
                     final String code = link.code;
-                    final String base = claimBase;
+                    // 手机在移动数据上打局域网地址必然超时；一次性码又只有 60 秒，
+                    // 所以先试局域网（快），失败再走隧道。
+                    final java.util.List<String> candidates = new java.util.ArrayList<>();
+                    if (!link.base.isEmpty()) candidates.add(link.base);
+                    if (!link.tunnel.isEmpty() && !candidates.contains(link.tunnel)) candidates.add(link.tunnel);
                     status.setText("正在用一次性码换取访问凭证…");
                     new Thread(() -> {
-                        JSONObject claimed = Http.claim(base, code);
-                        final String claimedToken = claimed == null ? "" : claimed.optString("token", "");
-                        final String claimedTunnel = claimed == null ? "" : claimed.optString("tunnel", "");
+                        JSONObject claimed = null;
+                        for (String base : candidates) {
+                            claimed = Http.claim(base, code);
+                            if (claimed != null && !claimed.optString("token", "").isEmpty()) break;
+                        }
+                        final JSONObject result = claimed;
+                        final String claimedToken = result == null ? "" : result.optString("token", "");
+                        final String claimedTunnel = result == null ? "" : result.optString("tunnel", "");
                         runOnUiThread(() -> {
                             if (claimedToken.isEmpty()) {
                                 status.setText("配对码已失效（60 秒过期），请回电脑刷新二维码");
@@ -197,7 +205,6 @@ public class MainActivity extends Activity {
                             }
                             cfg.token = claimedToken;
                             if (!claimedTunnel.isEmpty()) cfg.tunnel = claimedTunnel;
-                            cfg.save(this);
                             afterClaim();
                         });
                     }, "dshremote-claim").start();

@@ -1,6 +1,6 @@
 {
   "name": "dshremote-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "DSH Remote 桥插件：监听 DSH 的回合结束事件并推送给手机，把 DSH Web 反代到局域网端口，并在 Web UI 左下角提供配对二维码。",

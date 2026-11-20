@@ -179,17 +179,16 @@ struct Index {
     if (result.needsClaim) {
       this.testResult = '正在用一次性码换取访问凭证…';
       const lanBase = result.host.length > 0 ? `http://${result.host}:${result.port}` : '';
-      const candidates: string[] = lanBase.length > 0 ? [lanBase] : [];
+      const candidates: string[] = [];
+      if (lanBase.length > 0) {
+        candidates.push(lanBase);
+      }
       if (result.tunnel.length > 0) {
         candidates.push(result.tunnel);
       }
-      let claimed: ClaimResult | null = null;
-      for (const candidateBase of candidates) {
-        claimed = await BridgeHttp.claim(candidateBase, result.code);
-        if (claimed !== null) {
-          break;
-        }
-      }
+      // 一次性码 60 秒就过期：别一个地址一个地址串行等超时，
+      // 手机在 4G 上打局域网地址必然要耗掉一整个 connectTimeout。
+      const claimed: ClaimResult | null = await this.claimAny(candidates, result.code);
       if (claimed === null) {
         this.testResult = '配对码已失效（一次性码 60 秒过期），请回电脑刷新二维码';
         this.stage = 'scan';
@@ -207,6 +206,40 @@ struct Index {
     this.tunnelInput = cfg.tunnel;
     this.testResult = `已配对：${result.name}`;
     this.saveAndEnter();
+  }
+
+  /** 对多个候选地址同时发 claim，先成功的赢（一次性码本来就只能用一次）。 */
+  private async claimAny(candidates: string[], code: string): Promise<ClaimResult | null> {
+    if (candidates.length === 0) {
+      return null;
+    }
+    if (candidates.length === 1) {
+      return await BridgeHttp.claim(candidates[0], code);
+    }
+    return new Promise<ClaimResult | null>((resolve: (value: ClaimResult | null) => void) => {
+      let settled = false;
+      let pending = candidates.length;
+      for (const base of candidates) {
+        BridgeHttp.claim(base, code).then((found: ClaimResult | null) => {
+          if (!settled && found !== null) {
+            settled = true;
+            resolve(found);
+            return;
+          }
+          pending -= 1;
+          if (pending === 0 && !settled) {
+            settled = true;
+            resolve(null);
+          }
+        }).catch(() => {
+          pending -= 1;
+          if (pending === 0 && !settled) {
+            settled = true;
+            resolve(null);
+          }
+        });
+      }
+    });
   }
 
   private async scanPair(): Promise<void> {
@@ -519,7 +552,7 @@ struct Index {
       }
       .layoutWeight(1)
 
-      Text('v0.2.1 · 电脑端需要 dshremote-bridge 插件')
+      Text('v0.2.2 · 电脑端需要 dshremote-bridge 插件')
         .fontSize(11)
         .fontColor('#9CA3AF')
         .margin({ bottom: 18 })

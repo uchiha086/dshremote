@@ -1,4 +1,4 @@
-# DSH Remote · Android 0.2.0
+# DSH Remote · Android 0.2.2
 
 用手机远程指挥电脑上的 DeepSeek Harness：全屏 WebView 打开 DSH 网页，回合结束时手机通知栏弹一条提醒。
 
@@ -8,11 +8,11 @@
 
 | 项 | 值 |
 |---|---|
-| 文件 | `dshremote-android-0.2.0.apk` |
+| 文件 | `dshremote-android-0.2.2.apk` |
 | 大小 | 41,446 B |
 | SHA-256 | `332104799A12C96EBB648276844B7A26E58C78F73E7DC305A52C8BC62DD15755` |
 | 包名 | `com.dshremote.app` |
-| 版本 | versionCode 3 / versionName 0.2.0 |
+| 版本 | versionCode 5 / versionName 0.2.2 |
 | 系统要求 | **Android 7.0+**（minSdk 24，targetSdk 34） |
 | ABI | 全平台通用（纯 Java，无 native 库） |
 | 签名 | APK Signature Scheme **v2 + v3**（无 v1，故 7.0 以下装不了） |
@@ -33,7 +33,7 @@
 git clone https://github.com/uchiha086/dshremote.git
 cd dshremote/android
 .\build.ps1 -Sdk 'C:\path\to\android-sdk' -Jdk 'C:\path\to\jdk'
-# 产物：dshremote-android-0.2.0.apk
+# 产物：dshremote-android-0.2.2.apk
 ```
 
 只需要 JDK 17+ 与 Android SDK（`build-tools;34.0.0` + `platforms;android-34`），脚本走 `aapt2 → javac → d8 → zipalign → apksigner`，不需要 Gradle。详见 [docs/使用与签名.md](https://github.com/uchiha086/dshremote/blob/main/docs/使用与签名.md)。
