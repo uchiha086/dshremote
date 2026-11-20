@@ -10,6 +10,7 @@
 [![HarmonyOS NEXT](https://img.shields.io/badge/HarmonyOS%20NEXT-API%2026-000000)](https://developer.huawei.com/consumer/cn/harmonyos/)
 [![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84)](https://developer.android.com/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+[![Android APK](https://img.shields.io/badge/download-APK%2041%20KB-3DDC84)](https://github.com/uchiha086/dshremote/releases/tag/v0.2.0-android)
 
 <img src="docs/icon.png" width="128" alt="DSH Remote 图标">
 
