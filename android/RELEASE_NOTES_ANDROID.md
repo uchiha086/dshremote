@@ -10,7 +10,7 @@
 |---|---|
 | 文件 | `dshremote-android-0.2.2.apk` |
 | 大小 | 41,446 B |
-| SHA-256 | `332104799A12C96EBB648276844B7A26E58C78F73E7DC305A52C8BC62DD15755` |
+| SHA-256 | `B194E9C26A73A333FA6AE66CCE2339B1F2B2B6382312542D71447B1163E27DC1` |
 | 包名 | `com.dshremote.app` |
 | 版本 | versionCode 5 / versionName 0.2.2 |
 | 系统要求 | **Android 7.0+**（minSdk 24，targetSdk 34） |
