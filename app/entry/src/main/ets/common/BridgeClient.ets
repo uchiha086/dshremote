@@ -123,11 +123,101 @@ export class BridgeHttp {
   }
 }
 
+/** /events 的返回。 */
+interface EventsResult {
+  ok: boolean;
+  events: WireFrame[];
+}
+
+/** 用 HTTP 轮询 /events 取 turn_end：鸿蒙 WebSocket 发不出帧，改用轮询兜底。 */
+export class BridgePoller {
+  private timer: number = -1;
+  private busy: boolean = false;
+  private stopped: boolean = true;
+  private baseUrl: string = '';
+  private token: string = '';
+  private since: number = 0;
+
+  onStatus: (text: string) => void = (text: string) => {
+  };
+  onTurnEnd: (event: TurnEndEvent) => void = (event: TurnEndEvent) => {
+  };
+
+  start(host: string, port: number, token: string): void {
+    this.stop();
+    this.baseUrl = `http://${host}:${port}`;
+    this.token = token;
+    // 从此刻开始算，避免把桥里缓存的历史事件全部当新通知重放。
+    this.since = Date.now();
+    this.stopped = false;
+    this.tick();
+    this.timer = setInterval(() => {
+      this.tick();
+    }, 3000);
+  }
+
+  private async tick(): Promise<void> {
+    if (this.stopped || this.busy) {
+      return;
+    }
+    this.busy = true;
+    const client = http.createHttp();
+    try {
+      const url = `${this.baseUrl}/events?token=${encodeURIComponent(this.token)}&since=${this.since}`;
+      const response = await client.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 5000,
+        readTimeout: 8000
+      });
+      if (response.responseCode === 200) {
+        const body = JSON.parse(String(response.result)) as EventsResult;
+        if (body.ok && body.events.length > 0) {
+          for (const frame of body.events) {
+            if (frame.ts > this.since) {
+              this.since = frame.ts;
+            }
+            if (frame.type !== 'turn_end') {
+              continue;
+            }
+            const event = new TurnEndEvent();
+            event.sessionId = frame.sessionId;
+            event.sessionTitle = frame.sessionTitle;
+            event.question = frame.question;
+            event.answerHead = frame.answerHead;
+            event.status = frame.status;
+            event.turn = frame.turn;
+            this.onTurnEnd(event);
+          }
+          this.onStatus('轮询就绪');
+        }
+      } else if (response.responseCode === 401) {
+        this.onStatus('token 不对');
+      }
+    } catch (error) {
+      // 网络抖动下一轮再试，不打扰用户。
+    } finally {
+      client.destroy();
+      this.busy = false;
+    }
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer >= 0) {
+      clearInterval(this.timer);
+      this.timer = -1;
+    }
+  }
+}
+
 /** 与桥插件的 WebSocket 长连接：负责鉴权、心跳与推送解析。 */
 export class BridgeSocket {
   private ws: webSocket.WebSocket | null = null;
   private heartbeat: number = -1;
   private reconnectTimer: number = -1;
+  private authTimer: number = -1;
+  private authed: boolean = false;
+  private wsOpen: boolean = false;
   private closedByUser: boolean = false;
   private host: string = '';
   private port: number = 0;
@@ -148,10 +238,13 @@ export class BridgeSocket {
 
   private open(): void {
     this.teardown();
+    this.wsOpen = false;
     const ws = webSocket.createWebSocket();
     this.ws = ws;
 
     ws.on('open', () => {
+      this.wsOpen = true;
+      this.onStatus('WS 已连接');
       this.sendAuth();
     });
 
@@ -165,6 +258,8 @@ export class BridgeSocket {
         return;
       }
       if (frame.type === 'hello') {
+        this.authed = true;
+        this.stopAuthRetry();
         this.onStatus('已连接 · 推送就绪');
         return;
       }
@@ -195,17 +290,38 @@ export class BridgeSocket {
       this.onStatus('连接出错');
     });
 
-    ws.connect(`ws://${this.host}:${this.port}/ws`, {
-      header: { 'Sec-WebSocket-Protocol': 'dshremote-bridge-v1' }
-    }, (err: BusinessError) => {
+    // 不手工塞 Sec-WebSocket-Protocol：ArkWeb 会把它当受限头丢弃，可能导致握手对不上、open 永远不触发。
+    ws.connect(`ws://${this.host}:${this.port}/ws`, (err: BusinessError) => {
       if (err) {
         this.onStatus('连接失败，重试中');
         this.scheduleReconnect();
         return;
       }
-      // 鸿蒙的 connect 回调就是"已连上"，open 事件不一定触发，两边都发一次 auth（重复无副作用）。
-      this.sendAuth();
+      // connect 回调早于握手完成，此时直接 send 会被丢弃；用重试循环补发，直到收到 hello 或超时。
+      this.startAuthRetry();
     });
+  }
+
+  private startAuthRetry(): void {
+    this.stopAuthRetry();
+    this.authed = false;
+    let attempts: number = 0;
+    this.authTimer = setInterval(() => {
+      if (this.authed || attempts >= 15) {
+        this.stopAuthRetry();
+        return;
+      }
+      attempts += 1;
+      this.sendAuth();
+    }, 600);
+    this.sendAuth();
+  }
+
+  private stopAuthRetry(): void {
+    if (this.authTimer >= 0) {
+      clearInterval(this.authTimer);
+      this.authTimer = -1;
+    }
   }
 
   private sendAuth(): void {
@@ -213,11 +329,17 @@ export class BridgeSocket {
     if (ws === null) {
       return;
     }
+    const payload = JSON.stringify({ type: 'auth', token: this.token, deviceName: 'HOP-AL10' });
     try {
-      ws.send(JSON.stringify({ type: 'auth', token: this.token, deviceName: 'HOP-AL10' }));
-      this.startHeartbeat();
+      ws.send(payload, (err: BusinessError, ok: boolean) => {
+        if (err) {
+          this.onStatus(`鉴权发送失败 ${err.code}`);
+          return;
+        }
+        this.startHeartbeat();
+      });
     } catch (error) {
-      this.onStatus('鉴权发送失败');
+      this.onStatus('鉴权发送异常');
     }
   }
 
@@ -227,7 +349,11 @@ export class BridgeSocket {
       const ws = this.ws;
       if (ws !== null) {
         try {
-          ws.send(JSON.stringify({ type: 'ping' }));
+          ws.send(JSON.stringify({ type: 'ping' }), (err: BusinessError) => {
+            if (err) {
+              this.onStatus('心跳发送失败');
+            }
+          });
         } catch (error) {
           // 连接已坏，交给 close 处理
         }
@@ -262,6 +388,9 @@ export class BridgeSocket {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = -1;
     }
+    this.stopAuthRetry();
+    this.authed = false;
+    this.wsOpen = false;
     this.stopHeartbeat();
     const ws = this.ws;
     this.ws = null;

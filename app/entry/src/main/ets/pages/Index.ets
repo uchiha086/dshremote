@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
 import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
-import { BridgeHttp, BridgeSocket, TurnEndEvent } from '../common/BridgeClient';
+import { BridgeHttp, BridgePoller, TurnEndEvent } from '../common/BridgeClient';
 
 @Entry
 @Component
@@ -18,7 +18,7 @@ struct Index {
 
   private controller: webview.WebviewController = new webview.WebviewController();
   private cfg: BridgeConfig = new BridgeConfig();
-  private socket: BridgeSocket = new BridgeSocket();
+  private poller: BridgePoller = new BridgePoller();
 
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
@@ -38,7 +38,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
-    this.socket.disconnect();
+    this.poller.stop();
   }
 
   private readForm(): BridgeConfig {
@@ -83,14 +83,14 @@ struct Index {
   private async enterMain(): Promise<void> {
     const lanBase = this.cfg.webUrl();
     this.webReady = false;
-    this.socket.onStatus = (text: string) => {
+    this.poller.onStatus = (text: string) => {
       this.statusText = text;
     };
-    this.socket.onTurnEnd = (event: TurnEndEvent) => {
+    this.poller.onTurnEnd = (event: TurnEndEvent) => {
       const title = event.sessionTitle.length > 0 ? event.sessionTitle : '会话';
       this.statusText = `回合结束 · ${title}`;
     };
-    this.socket.connect(this.cfg.host, this.cfg.port, this.cfg.token);
+    this.poller.start(this.cfg.host, this.cfg.port, this.cfg.token);
     // 让桥代取一次登录 cookie，再自己写进 WebView：避开 WebView 对 SameSite=Strict cookie 的拦截。
     const cookie = await BridgeHttp.authCookie(this.cfg.baseUrl(), this.cfg.token, lanBase);
     if (cookie.length > 0) {
@@ -170,7 +170,7 @@ struct Index {
         Button('设置')
           .buttonStyle(ButtonStyleMode.TEXTUAL)
           .onClick(() => {
-            this.socket.disconnect();
+            this.poller.stop();
             this.statusText = '已断开';
             this.stage = 'setup';
           })
@@ -185,7 +185,9 @@ struct Index {
           .width('100%')
           .layoutWeight(1)
           .onPageEnd(() => {
-            this.statusText = 'DSH 已加载';
+            if (this.statusText.length === 0) {
+              this.statusText = 'DSH 已加载';
+            }
           })
       } else {
         Column({ space: 10 }) {

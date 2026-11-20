@@ -75,6 +75,27 @@ function trimText(text, limit) {
   return `${flat.slice(0, limit)}…`
 }
 
+/** 本机所有非回环 IPv4 与本机名，用来拼 DSH Host 围栏认的 authority。 */
+function localAuthorities(ports) {
+  const hosts = new Set(['localhost', '127.0.0.1', os.hostname()])
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const item of list ?? []) {
+        if (item && item.family === 'IPv4' && !item.internal) hosts.add(item.address)
+      }
+    }
+  } catch {
+    // 拿不到网卡就只留 localhost。
+  }
+  const out = []
+  for (const host of hosts) {
+    for (const port of ports) {
+      if (Number.isFinite(port) && port > 0) out.push(`${host}:${port}`)
+    }
+  }
+  return out
+}
+
 /** turn/end 的 reason.kind 归一成手机端认识的三种状态。 */
 function normalizeStatus(reason) {
   const kind = String(reason?.kind ?? '').toLowerCase()
@@ -99,6 +120,16 @@ export function apply(ctx, config) {
   // DSH Web 用「进程启动令牌 + 按 authority 绑定的 cookie」鉴权：打开带 ?token= 的地址会下发 cookie。
   // 这里借宿主的 BrowserAuth 帮手机生成一次这样的地址，手机打开一次之后 cookie 就长期有效。
   const browserAuth = ctx.connection?.browserAuth ?? null
+
+  // DSH 的 Host 围栏只放行回环、监听 bind IP 和 trustedHosts；手机走局域网 authority 会被 403。
+  // 把本机各网卡 IPv4（桥端口 + 反代端口）注册进去，避免写死某个 IP。
+  const trustedList = ctx.connection?.trustedHosts
+  if (Array.isArray(trustedList)) {
+    const wanted = localAuthorities([options.port, options.proxyPort, upstreamPort])
+    for (const authority of wanted) {
+      if (!trustedList.includes(authority)) trustedList.push(authority)
+    }
+  }
 
   function log(message) {
     const line = `[${new Date().toISOString()}] ${message}`
@@ -335,8 +366,11 @@ export function apply(ctx, config) {
         response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
         return
       }
+      // since=<ts> 只回比它更新的事件，手机轮询时用它去重，避免每轮重发旧通知。
+      const since = Number(url.searchParams.get('since') ?? '')
+      const list = Number.isFinite(since) && since > 0 ? events.filter((frame) => Number(frame.ts) > since) : events
       response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
-      response.end(JSON.stringify({ ok: true, events }))
+      response.end(JSON.stringify({ ok: true, events: list }))
       return
     }
 
@@ -480,7 +514,7 @@ export function apply(ctx, config) {
       } catch (error) {
         log(`token 落盘失败：${error?.message ?? error}`)
       }
-      log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'}`)
+      log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'} trusted=${Array.isArray(trustedList) ? trustedList.length : 'no'}`)
     })()
 
     return () => {
