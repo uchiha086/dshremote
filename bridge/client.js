@@ -14,74 +14,75 @@ window.__ModuleLoader__.load({
     }
 
     // 桥可能和页面不同源：
-    // - 手机 / 浏览器经反代打开 → 页面是 http://<host>:7627，桥在 <host>:3088
-    // - 桌面端是 dsh-app://app 这类自定义协议 → 页面根本不带 http 端口，只能直接打回环
+    // - 桌面端是 dsh-app://app 这类自定义协议 → 从页面直接打 http://127.0.0.1:3088
+    //   会被浏览器的私有网络访问策略拦成 "Failed to fetch"，所以优先走 DSH
+    //   自己 web 服务上挂的同源路由（/dshremote/*）。
+    // - 手机 / 浏览器经反代打开 → 页面是 http://<host>:7627，同源路由同样在。
     const BRIDGE_PORT_FALLBACK = 3088
+    const SAME_ORIGIN_PREFIX = '/dshremote'
 
     function candidateBases() {
-      const bases = []
-      const push = (base) => {
-        if (!bases.includes(base)) bases.push(base)
+      const candidates = []
+      const push = (base, prefix) => {
+        const key = `${base}|${prefix}`
+        if (candidates.some((item) => `${item.base}|${item.prefix}` === key)) return
+        candidates.push({ base, prefix })
       }
-      const location = typeof window !== 'undefined' ? window.location : null
-      const protocol = location?.protocol ?? ''
-      if (protocol === 'http:' || protocol === 'https:') {
-        push('')
-        if (location.port !== String(BRIDGE_PORT_FALLBACK)) {
-          push(`${protocol}//${location.hostname}:${BRIDGE_PORT_FALLBACK}`)
-        }
-      }
-      push(`http://127.0.0.1:${BRIDGE_PORT_FALLBACK}`)
-      push(`http://localhost:${BRIDGE_PORT_FALLBACK}`)
-      return bases
+      push('', SAME_ORIGIN_PREFIX)
+      push(`http://127.0.0.1:${BRIDGE_PORT_FALLBACK}`, '')
+      push(`http://localhost:${BRIDGE_PORT_FALLBACK}`, '')
+      return candidates
     }
 
     /** 找到第一个能应答的桥地址（桌面端页面来源是 dsh-app://app，只能挨个试）。 */
     async function resolveBase() {
       const problems = []
-      for (const base of candidateBases()) {
-        const label = base === '' ? '同源' : base
+      for (const candidate of candidateBases()) {
+        const label = candidate.base === '' ? `同源 ${candidate.prefix}` : candidate.base
         try {
-          const response = await fetch(`${base}/health`, { cache: 'no-store' })
-          if (response.ok) return { base, problems }
+          const response = await fetch(`${candidate.base}${candidate.prefix}/health`, { cache: 'no-store' })
+          if (response.ok) return { base: candidate.base, prefix: candidate.prefix, problems }
           problems.push(`${label} → HTTP ${response.status}`)
         } catch (error) {
           problems.push(`${label} → ${error?.message ?? error}`)
         }
       }
-      return { base: '', problems }
+      return { base: '', prefix: '', problems }
     }
 
     /** 生成二维码前先体检：局域网、反代、隧道三段都通了才给码。 */
     async function runDiagnostics() {
       const resolved = await resolveBase()
-      if (!resolved.base) return { ok: false, checks: [], error: resolved.problems.join('；') || '找不到桥服务' }
+      if (!resolved.base && !resolved.prefix) {
+        return { ok: false, checks: [], error: resolved.problems.join('；') || '找不到桥服务' }
+      }
+      const root = `${resolved.base}${resolved.prefix}`
       try {
-        const response = await fetch(`${resolved.base}/pair/test`, { cache: 'no-store' })
+        const response = await fetch(`${root}/pair/test`, { cache: 'no-store' })
         if (!response.ok) {
           return { ok: false, checks: [], error: `体检接口 HTTP ${response.status}` }
         }
         const result = await response.json()
-        return { ...result, base: resolved.base }
+        return { ...result, base: resolved.base, prefix: resolved.prefix }
       } catch (error) {
         return { ok: false, checks: [], error: `体检失败：${error?.message ?? error}` }
       }
     }
 
     /** 体检通过后才取二维码。 */
-    async function loadPairing(base) {
+    async function loadPairing(root) {
       try {
-        const response = await fetch(`${base}/pair`, { cache: 'no-store' })
+        const response = await fetch(`${root}/pair`, { cache: 'no-store' })
         if (!response.ok) return { error: `/pair → HTTP ${response.status}` }
         const info = await response.json()
         let svg = ''
         try {
-          const svgResponse = await fetch(`${base}/pair.svg`, { cache: 'no-store' })
+          const svgResponse = await fetch(`${root}/pair.svg`, { cache: 'no-store' })
           if (svgResponse.ok) svg = await svgResponse.text()
         } catch {
           svg = ''
         }
-        return { base, info, svg }
+        return { root, info, svg }
       } catch (error) {
         return { error: `/pair → ${error?.message ?? error}` }
       }
@@ -176,7 +177,7 @@ window.__ModuleLoader__.load({
             setState({ phase: 'failed', diag })
             return
           }
-          const pair = await loadPairing(diag.base)
+          const pair = await loadPairing(`${diag.base}${diag.prefix ?? ''}`)
           if (!alive) return
           if (pair.error) {
             setState({ phase: 'failed', diag, error: pair.error })
@@ -226,7 +227,7 @@ window.__ModuleLoader__.load({
         } else {
           qrBox.push(h('img', {
             key: 'qr-img',
-            src: `${diag.base}/pair.svg?ts=${Date.now()}`,
+            src: `${diag.base}${diag.prefix ?? ''}/pair.svg?ts=${Date.now()}`,
             width: 216, height: 216, alt: '配对二维码',
             style: { display: 'block', borderRadius: 8, background: '#fff' },
           }))

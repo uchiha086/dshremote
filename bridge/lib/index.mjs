@@ -587,7 +587,7 @@ export function apply(ctx, config) {
     })
   }
 
-  const server = http.createServer((request, response) => {
+  const handleBridgeRequest = (request, response) => {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
 
     // 桌面端页面跑在 dsh-app://app 这类自定义协议下，请求桥属于跨源；
@@ -833,7 +833,35 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
 
     // 其余路径原样转给 DSH：这样一条隧道（指向 3088）就能同时当网页入口和控制接口用。
     proxyRequest(request, response)
-  })
+  }
+
+  const server = http.createServer(handleBridgeRequest)
+
+  // 桌面端页面来源是 dsh-app://app，从页面直接 fetch http://127.0.0.1:3088 会被
+  // 浏览器的私有网络访问（Private Network Access）策略拦成 "Failed to fetch"。
+  // 所以把同一套接口在 DSH 自己的 web 服务上再挂一遍，面板改用同源相对路径。
+  const SAME_ORIGIN_PREFIX = '/dshremote'
+  const sameOriginRoutes = ['/health', '/pair', '/pair.svg', '/pair.png', '/pair.html', '/pair/test']
+  const sameOriginDisposers = []
+  if (typeof ctx.webServer?.register === 'function') {
+    for (const suffix of sameOriginRoutes) {
+      const path = `${SAME_ORIGIN_PREFIX}${suffix}`
+      try {
+        const dispose = ctx.webServer.register({
+          kind: 'exact',
+          path,
+          handler: (request, response) => {
+            request.url = suffix
+            handleBridgeRequest(request, response)
+          },
+        })
+        if (typeof dispose === 'function') sameOriginDisposers.push(dispose)
+      } catch (error) {
+        log(`同源路由 ${path} 注册失败：${error?.message ?? error}`)
+      }
+    }
+    log(`同源路由已挂载 ${sameOriginDisposers.length} 条（${SAME_ORIGIN_PREFIX}/*）`)
+  }
 
   const wss = createWebSocketServer(server, { path: '/ws', protocol: WS_PROTOCOL, fallback: proxyUpgrade })
 
@@ -1200,6 +1228,13 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     return () => {
       clearInterval(heartbeat)
       clearInterval(beaconTimer)
+      for (const dispose of sameOriginDisposers) {
+        try {
+          dispose()
+        } catch {
+          // 卸载时路由表可能已经没了。
+        }
+      }
       if (tunnelWatch) {
         clearInterval(tunnelWatch)
         tunnelWatch = null
