@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { scanBarcode, scanCore } from '@kit.ScanKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { webview } from '@kit.ArkWeb';
 import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
 import { BridgeHttp, BridgePoller, TurnEndEvent } from '../common/BridgeClient';
@@ -49,6 +50,16 @@ struct Index {
       this.portInput = `${loaded.port}`;
       this.tokenInput = loaded.token;
       this.tunnelInput = loaded.tunnel;
+      // 冷启动时系统相机直接把 dshremote:// 链接交给本应用：此时 @Watch 不会触发，
+      // 必须在这里主动消费一次，否则会沿用 preferences 里的旧地址。
+      const pending = AppStorage.get<string>('pairUri') ?? '';
+      if (pending.length > 0) {
+        AppStorage.setOrCreate<string>('pairUri', '');
+        this.pairUri = '';
+        this.stage = 'setup';
+        this.applyPairText(pending);
+        return;
+      }
       if (loaded.valid()) {
         this.stage = 'main';
         await this.enterMain();
@@ -91,14 +102,22 @@ struct Index {
       return;
     }
     this.busy = true;
-    const health = await BridgeHttp.health(cfg.baseUrl());
+    this.cfg = cfg;
+    // 先把"走局域网还是走隧道"定下来：出门在外时局域网必然超时，
+    // 直接拿局域网地址去探测就会卡 5 秒再报 Operation timeout。
+    await this.pickTransport();
+    const health = await BridgeHttp.health(this.cfg.baseUrl());
+    hilog.info(0x0000, 'dshremote', '保存并进入 base=%{public}s health=%{public}s',
+      this.cfg.baseUrl(), health);
     if (!health.startsWith('桥')) {
       this.testResult = health;
       this.busy = false;
+      if (this.stage !== 'main') {
+        this.stage = 'setup';
+      }
       return;
     }
-    this.cfg = cfg;
-    await ConfigStore.save(cfg);
+    await ConfigStore.save(this.cfg);
     this.busy = false;
     this.stage = 'main';
     await this.enterMain();
@@ -119,6 +138,7 @@ struct Index {
     const result: PairResult = parsePairing(raw);
     if (!result.ok) {
       this.testResult = result.error;
+      hilog.error(0x0000, 'dshremote', '配对码解析失败：%{public}s', result.error);
       return;
     }
     const cfg = this.readForm();
@@ -129,6 +149,8 @@ struct Index {
     this.tokenInput = cfg.token;
     this.tunnelInput = cfg.tunnel;
     this.testResult = `已配对：${result.name}`;
+    hilog.info(0x0000, 'dshremote', '配对生效 host=%{public}s tunnel=%{public}s',
+      cfg.host, cfg.tunnel);
     this.saveAndEnter();
   }
 
@@ -158,12 +180,13 @@ struct Index {
     const webPort = Number(this.found.web.split(':').pop());
     cfg.proxyPort = Number.isFinite(webPort) && webPort > 0 ? webPort : 7627;
     cfg.token = this.found.token;
-    cfg.tunnel = '';
+    // 自动发现时顺手把电脑的公网地址也存下来：在家连一次，出门就能自动切隧道。
+    cfg.tunnel = this.found.publicUrl.length > 0 ? this.found.publicUrl : '';
     this.cfg = cfg;
     this.hostInput = cfg.host;
     this.portInput = `${cfg.port}`;
     this.tokenInput = cfg.token;
-    this.tunnelInput = '';
+    this.tunnelInput = cfg.tunnel;
     this.testResult = `连接 ${this.found.name}…`;
     await this.saveAndEnter();
   }

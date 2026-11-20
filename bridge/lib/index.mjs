@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import dgram from 'node:dgram'
 import fs from 'node:fs'
 import http from 'node:http'
+import https from 'node:https'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -926,11 +927,52 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   function adoptTunnelUrl(url) {
     const clean = String(url).replace(/\/+$/, '')
     if (!/^https:\/\//.test(clean) || clean === publicUrl) return
-    publicUrl = clean
-    trustHost(clean.replace(/^https?:\/\//, '').split('/')[0].toLowerCase())
-    writePublicUrl(publicUrl)
-    tunnelAttempt = 0
-    log(`隧道就绪 ${publicUrl}`)
+    // cloudflared 的日志里会出现 api.trycloudflare.com 这类服务域名，不能当成隧道地址。
+    const authority = clean.replace(/^https?:\/\//, '').split('/')[0].toLowerCase()
+    if (!authority.endsWith('.trycloudflare.com')) return
+    if (/^(api|www|dash|dashv2)\.trycloudflare\.com$/.test(authority)) return
+    if (authority.split('-').length < 3) return
+    // 再自证一次：只有公网 /health 真的通了才发布，避免把错误地址写进二维码。
+    verifyTunnel(clean, authority).then((ok) => {
+      if (!ok || clean === publicUrl) return
+      publicUrl = clean
+      trustHost(authority)
+      writePublicUrl(publicUrl)
+      tunnelAttempt = 0
+      log(`隧道就绪 ${publicUrl}`)
+    })
+  }
+
+  /** 从本机经隧道打一次 /health，确认这条隧道真的能用。 */
+  function verifyTunnel(base, authority) {
+    return new Promise((resolve) => {
+      let settled = false
+      const done = (ok) => {
+        if (settled) return
+        settled = true
+        resolve(ok)
+      }
+      try {
+        const request = https.request({
+          host: authority,
+          port: 443,
+          path: '/health',
+          method: 'GET',
+          timeout: 8000,
+          headers: { host: authority },
+        }, (response) => {
+          let body = ''
+          response.setEncoding('utf8')
+          response.on('data', (chunk) => { body += chunk })
+          response.on('end', () => done(response.statusCode === 200 && body.includes('dshremote-bridge')))
+        })
+        request.on('timeout', () => { request.destroy(); done(false) })
+        request.on('error', () => done(false))
+        request.end()
+      } catch {
+        done(false)
+      }
+    })
   }
 
   function startTunnel() {
