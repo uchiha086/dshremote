@@ -12,7 +12,7 @@ const BRIDGE_VERSION = '0.1.0'
 /** WebSocket 子协议标识，握手时就固定，避免手机连到别的服务上。 */
 const WS_PROTOCOL = 'dshremote-bridge-v1'
 
-/** 鉴权超时：连上后必须在这个时间内发 auth 帧，否则断开。 */
+/** 鉴权超时：连上后必须在这段时间内发 auth 帧，否则断开。 */
 const AUTH_TIMEOUT_MS = 10_000
 
 /** 心跳间隔。 */
@@ -33,6 +33,17 @@ const DEFAULT_OPTIONS = {
   answerHeadChars: 120,
   questionChars: 200,
   logFile: '',
+  tokenFile: '',
+}
+
+/** 读已保存的 token；只认长十六进制串，避免把脏内容当口令用。 */
+function readToken(file) {
+  try {
+    const text = fs.readFileSync(file, 'utf8').trim()
+    return /^[a-f0-9]{16,128}$/i.test(text) ? text : ''
+  } catch {
+    return ''
+  }
 }
 
 function homeDir() {
@@ -77,7 +88,17 @@ export function apply(ctx, config) {
   if (!options.enabled) return
 
   const logFile = expandHome(options.logFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.log')
-  const token = String(options.token ?? '').trim() || crypto.randomBytes(16).toString('hex')
+  // token 要跨重启稳定：优先用配置里的，其次沿用上次落盘的，最后才随机生成。
+  const tokenFile = expandHome(options.tokenFile) || path.join(homeDir(), '.dsh', 'dshremote-bridge.token')
+  const token = String(options.token ?? '').trim() || readToken(tokenFile) || crypto.randomBytes(16).toString('hex')
+
+  // DSH Web 每次启动端口可能不同（7626、10628…），以宿主 webServer 实际端口为准。
+  const webPort = Number(ctx.webServer?.port)
+  const upstreamPort = Number.isFinite(webPort) && webPort > 0 ? webPort : options.upstreamPort
+
+  // DSH Web 用「进程启动令牌 + 按 authority 绑定的 cookie」鉴权：打开带 ?token= 的地址会下发 cookie。
+  // 这里借宿主的 BrowserAuth 帮手机生成一次这样的地址，手机打开一次之后 cookie 就长期有效。
+  const browserAuth = ctx.connection?.browserAuth ?? null
 
   function log(message) {
     const line = `[${new Date().toISOString()}] ${message}`
@@ -206,6 +227,32 @@ export function apply(ctx, config) {
       return
     }
 
+    if (url.pathname === '/auth/url') {
+      if (url.searchParams.get('token') !== token) {
+        response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'bad-token' }))
+        return
+      }
+      if (!browserAuth?.authenticatedUrl) {
+        response.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'browser-auth-unavailable' }))
+        return
+      }
+      const hostname = String(request.headers.host ?? '127.0.0.1:0').split(':')[0]
+      const base = url.searchParams.get('base') || `http://${hostname}:${options.proxyPort}/`
+      try {
+        const authenticated = browserAuth.authenticatedUrl(base)
+        log(`签发 DSH Web 登录地址 authority=${base}`)
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        response.end(JSON.stringify({ ok: true, url: authenticated }))
+      } catch (error) {
+        log(`签发登录地址失败：${error?.message ?? error}`)
+        response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+        response.end(JSON.stringify({ ok: false, error: 'failed' }))
+      }
+      return
+    }
+
     if (url.pathname === '/events') {
       if (url.searchParams.get('token') !== token) {
         response.writeHead(401, { 'content-type': 'application/json; charset=utf-8' })
@@ -314,7 +361,7 @@ export function apply(ctx, config) {
     proxy = net.createServer((socket) => {
       const peer = `${socket.remoteAddress}:${socket.remotePort}`
       log(`反代连接 ${peer}`)
-      const upstream = net.connect({ host: options.upstreamHost, port: options.upstreamPort })
+      const upstream = net.connect({ host: options.upstreamHost, port: upstreamPort })
       socket.pipe(upstream).pipe(socket)
       const close = () => {
         socket.destroy()
@@ -349,14 +396,15 @@ export function apply(ctx, config) {
       await listen(server, options.port, options.bind, 'bridge')
       if (proxy) await listen(proxy, options.proxyPort, options.bind, '反代')
       try {
-        const tokenFile = path.join(homeDir(), '.dsh', 'dshremote-bridge.token')
         fs.mkdirSync(path.dirname(tokenFile), { recursive: true })
-        fs.writeFileSync(tokenFile, token, { encoding: 'utf8', mode: 0o600 })
-        log(`token 已写入 ${tokenFile}`)
+        if (readToken(tokenFile) !== token) {
+          fs.writeFileSync(tokenFile, token, { encoding: 'utf8', mode: 0o600 })
+          log(`token 已写入 ${tokenFile}`)
+        }
       } catch (error) {
         log(`token 落盘失败：${error?.message ?? error}`)
       }
-      log(`就绪 token=${token}`)
+      log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'}`)
     })()
 
     return () => {
@@ -375,4 +423,4 @@ export function apply(ctx, config) {
   })
 }
 
-export default { name: 'dshremote-bridge', apply }
+export default { name: 'dshremote-bridge', inject: ['connection', 'webServer'], apply }

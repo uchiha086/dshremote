@@ -52,6 +52,7 @@ async function main() {
     proxyPort: PROXY_PORT,
     bind: '127.0.0.1',
     token: TOKEN,
+    tokenFile: 'C:\\Users\\user\\Desktop\\dshremote\\bridge\\test\\smoke.token',
     logFile: 'C:\\Users\\user\\Desktop\\dshremote\\bridge\\test\\smoke.log',
   })
   await sleep(600)
@@ -122,6 +123,12 @@ async function main() {
   check('/events 无 token 返回 401', unauth === 401, String(unauth))
   const authed = await fetch(`http://127.0.0.1:${PORT}/events?token=${TOKEN}`).then((r) => r.json())
   check('/events 带 token 返回事件', authed.ok === true && authed.events.length === 1, `${authed.events?.length} 条`)
+
+  // 7. /auth/url 需要 token（没有 connection 服务时应 503，而不是 500 崩掉）
+  const noAuthToken = await fetch(`http://127.0.0.1:${PORT}/auth/url`).then((r) => r.status)
+  check('/auth/url 无 token 返回 401', noAuthToken === 401, String(noAuthToken))
+  const noService = await fetch(`http://127.0.0.1:${PORT}/auth/url?token=${TOKEN}`).then((r) => r.status)
+  check('/auth/url 无 browserAuth 返回 503', noService === 503, String(noService))
 
   good.close()
   disposer?.()

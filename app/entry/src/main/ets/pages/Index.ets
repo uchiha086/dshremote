@@ -1,0 +1,198 @@
+import { common } from '@kit.AbilityKit';
+import { webview } from '@kit.ArkWeb';
+import { BridgeConfig, ConfigStore } from '../common/ConfigStore';
+import { BridgeHttp, BridgeSocket, TurnEndEvent } from '../common/BridgeClient';
+
+@Entry
+@Component
+struct Index {
+  @State stage: string = 'loading';
+  @State hostInput: string = '';
+  @State portInput: string = '3088';
+  @State tokenInput: string = '';
+  @State statusText: string = '未连接';
+  @State testResult: string = '';
+  @State busy: boolean = false;
+  @State webUrl: string = '';
+
+  private controller: webview.WebviewController = new webview.WebviewController();
+  private cfg: BridgeConfig = new BridgeConfig();
+  private socket: BridgeSocket = new BridgeSocket();
+
+  aboutToAppear(): void {
+    const context = getContext(this) as common.UIAbilityContext;
+    ConfigStore.init(context).then(async () => {
+      const loaded = await ConfigStore.load();
+      this.cfg = loaded;
+      this.hostInput = loaded.host;
+      this.portInput = `${loaded.port}`;
+      this.tokenInput = loaded.token;
+      if (loaded.valid()) {
+        this.stage = 'main';
+        await this.enterMain();
+      } else {
+        this.stage = 'setup';
+      }
+    });
+  }
+
+  aboutToDisappear(): void {
+    this.socket.disconnect();
+  }
+
+  private readForm(): BridgeConfig {
+    const cfg = new BridgeConfig();
+    cfg.host = this.hostInput.trim();
+    cfg.port = Number(this.portInput.trim());
+    if (!Number.isFinite(cfg.port) || cfg.port <= 0) {
+      cfg.port = 3088;
+    }
+    cfg.token = this.tokenInput.trim();
+    cfg.proxyPort = 7627;
+    return cfg;
+  }
+
+  private async testConnection(): Promise<void> {
+    this.busy = true;
+    const cfg = this.readForm();
+    this.testResult = await BridgeHttp.health(cfg.baseUrl());
+    this.busy = false;
+  }
+
+  private async saveAndEnter(): Promise<void> {
+    const cfg = this.readForm();
+    if (!cfg.valid()) {
+      this.testResult = 'IP、端口、token 都要填';
+      return;
+    }
+    this.busy = true;
+    const health = await BridgeHttp.health(cfg.baseUrl());
+    if (!health.startsWith('桥')) {
+      this.testResult = health;
+      this.busy = false;
+      return;
+    }
+    this.cfg = cfg;
+    await ConfigStore.save(cfg);
+    this.busy = false;
+    this.stage = 'main';
+    await this.enterMain();
+  }
+
+  private async enterMain(): Promise<void> {
+    const lanBase = this.cfg.webUrl();
+    this.webUrl = lanBase;
+    this.socket.onStatus = (text: string) => {
+      this.statusText = text;
+    };
+    this.socket.onTurnEnd = (event: TurnEndEvent) => {
+      const title = event.sessionTitle.length > 0 ? event.sessionTitle : '会话';
+      this.statusText = `回合结束 · ${title}`;
+    };
+    this.socket.connect(this.cfg.host, this.cfg.port, this.cfg.token);
+    // 首次进主界面时，用桥签发的地址登录一次，之后 WebView 靠 cookie 免登录。
+    const auth = await BridgeHttp.authUrl(this.cfg.baseUrl(), this.cfg.token, lanBase);
+    if (auth.length > 0) {
+      this.webUrl = auth;
+    }
+  }
+
+  @Builder
+  setupView() {
+    Column({ space: 14 }) {
+      Text('连接你的电脑').fontSize(26).fontWeight(FontWeight.Bold)
+      Text('先在电脑上装好 dshremote-bridge 插件，把它的 token 填进来')
+        .fontSize(13)
+        .fontColor('#666666')
+        .textAlign(TextAlign.Center)
+        .padding({ left: 24, right: 24 })
+
+      TextInput({ placeholder: '电脑 IP，例如 192.168.68.225', text: this.hostInput })
+        .onChange((value: string) => {
+          this.hostInput = value;
+        })
+        .width('100%')
+
+      TextInput({ placeholder: '端口，默认 3088', text: this.portInput })
+        .type(InputType.Number)
+        .onChange((value: string) => {
+          this.portInput = value;
+        })
+        .width('100%')
+
+      TextInput({ placeholder: '配对 token', text: this.tokenInput })
+        .onChange((value: string) => {
+          this.tokenInput = value;
+        })
+        .width('100%')
+
+      Row({ space: 12 }) {
+        Button('测试连接')
+          .enabled(!this.busy)
+          .onClick(() => {
+            this.testConnection();
+          })
+        Button('保存并进入')
+          .enabled(!this.busy)
+          .onClick(() => {
+            this.saveAndEnter();
+          })
+      }
+
+      if (this.testResult.length > 0) {
+        Text(this.testResult).fontSize(13).fontColor('#0a7').textAlign(TextAlign.Center)
+      }
+    }
+    .padding({ left: 24, right: 24 })
+    .width('100%')
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  mainView() {
+    Column() {
+      Row({ space: 8 }) {
+        Text(this.statusText).fontSize(13).fontColor('#666666').layoutWeight(1)
+        Button('刷新')
+          .buttonStyle(ButtonStyleMode.TEXTUAL)
+          .onClick(() => {
+            this.controller.refresh();
+          })
+        Button('设置')
+          .buttonStyle(ButtonStyleMode.TEXTUAL)
+          .onClick(() => {
+            this.socket.disconnect();
+            this.statusText = '已断开';
+            this.stage = 'setup';
+          })
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+
+      Web({ src: this.webUrl, controller: this.controller })
+        .domStorageAccess(true)
+        .fileAccess(false)
+        .width('100%')
+        .layoutWeight(1)
+        .onPageEnd(() => {
+          this.statusText = '页面已加载 · ' + this.statusText;
+        })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  build() {
+    Column() {
+      if (this.stage === 'main') {
+        this.mainView()
+      } else if (this.stage === 'setup') {
+        this.setupView()
+      } else {
+        Text('正在读取配置…').fontSize(14).fontColor('#888888')
+      }
+    }
+    .width('100%')
+    .height('100%')
+  }
+}
