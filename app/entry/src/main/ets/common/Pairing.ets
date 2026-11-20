@@ -65,6 +65,7 @@ export function parsePairing(raw: string): PairResult {
   }
   const base = fields.get('base') ?? '';
   const web = fields.get('web') ?? base;
+  const tunnel = fields.get('tunnel') ?? '';
   const token = fields.get('token') ?? '';
   if (token.length < 16) {
     out.error = '配对码里没有有效的 token';
@@ -72,19 +73,25 @@ export function parsePairing(raw: string): PairResult {
   }
   out.token = token;
   out.name = fields.get('name') ?? '电脑';
+  // 先解析局域网地址（可能没有，比如只有隧道时）
   if (base.startsWith('https://')) {
-    // 隧道：控制接口和网页都走同一个域名。
     out.tunnel = base.replace(/\/+$/, '');
-  } else {
+  } else if (base.length > 0) {
     const parsed = parseHttp(base);
-    if (!parsed.ok) {
-      out.error = '配对码里的地址看不懂';
-      return out;
+    if (parsed.ok) {
+      out.host = parsed.host;
+      out.port = parsed.port;
+      const parsedWeb = parseHttp(web);
+      out.proxyPort = parsedWeb.ok ? parsedWeb.port : 7627;
     }
-    out.host = parsed.host;
-    out.port = parsed.port;
-    const parsedWeb = parseHttp(web);
-    out.proxyPort = parsedWeb.ok ? parsedWeb.port : 7627;
+  }
+  // 二维码同时带局域网 + 公网时，两个都留下：先在局域网直连，不行再自动走隧道。
+  if (tunnel.startsWith('https://')) {
+    out.tunnel = tunnel.replace(/\/+$/, '');
+  }
+  if (out.tunnel.length === 0 && out.host.length === 0) {
+    out.error = '配对码里的地址看不懂';
+    return out;
   }
   out.ok = true;
   return out;
@@ -93,12 +100,12 @@ export function parsePairing(raw: string): PairResult {
 /** 把解析结果写进配置对象（不动全局状态，便于测试）。 */
 export function applyPairing(cfg: BridgeConfig, result: PairResult): void {
   cfg.token = result.token;
-  if (result.tunnel.length > 0) {
-    cfg.tunnel = result.tunnel;
-  } else {
-    cfg.tunnel = '';
+  cfg.tunnel = result.tunnel;
+  if (result.host.length > 0) {
     cfg.host = result.host;
     cfg.port = result.port;
     cfg.proxyPort = result.proxyPort;
   }
+  // 两个地址都有时先试局域网；只有隧道就直接走公网。
+  cfg.preferTunnel = result.host.length === 0 && result.tunnel.length > 0;
 }

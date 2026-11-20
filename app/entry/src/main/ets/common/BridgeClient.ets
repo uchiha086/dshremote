@@ -22,6 +22,12 @@ interface AuthCookieResult {
   cookie: string;
 }
 
+/** /pair 的返回里我们关心的部分：当前公网地址（没起隧道时为空串）。 */
+interface PairInfoResult {
+  ok: boolean;
+  tunnel: string;
+}
+
 /** 桥插件推来的帧，字段按需取。 */
 interface WireFrame {
   type: string;
@@ -56,14 +62,14 @@ function parseJson(text: string): WireFrame | null {
 
 /** 电脑侧桥插件的 HTTP 接口。 */
 export class BridgeHttp {
-  /** 探测 /health，返回可直接展示的文案。 */
-  static async health(baseUrl: string): Promise<string> {
+  /** 探测 /health，返回可直接展示的文案。timeoutMs 用来做"局域网没戏就赶紧换隧道"的快探测。 */
+  static async health(baseUrl: string, timeoutMs: number = 5000): Promise<string> {
     const client = http.createHttp();
     try {
       const response = await client.request(`${baseUrl}/health`, {
         method: http.RequestMethod.GET,
-        connectTimeout: 5000,
-        readTimeout: 5000
+        connectTimeout: timeoutMs,
+        readTimeout: timeoutMs
       });
       if (response.responseCode !== 200) {
         return `HTTP ${response.responseCode}`;
@@ -93,6 +99,30 @@ export class BridgeHttp {
       }
       const body = JSON.parse(String(response.result)) as AuthUrlResult;
       return body.ok ? body.url : '';
+    } catch (error) {
+      return '';
+    } finally {
+      client.destroy();
+    }
+  }
+
+  /**
+   * 读一次桥的配对信息，主要用来自愈：电脑重启后隧道地址会变，
+   * 只要这次能连上局域网，就把新的公网地址带回来更新本地配置。
+   */
+  static async pairInfo(baseUrl: string): Promise<string> {
+    const client = http.createHttp();
+    try {
+      const response = await client.request(`${baseUrl}/pair`, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 4000,
+        readTimeout: 6000
+      });
+      if (response.responseCode !== 200) {
+        return '';
+      }
+      const body = JSON.parse(String(response.result)) as PairInfoResult;
+      return body.ok && body.tunnel ? body.tunnel : '';
     } catch (error) {
       return '';
     } finally {

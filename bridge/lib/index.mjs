@@ -238,9 +238,18 @@ export function apply(ctx, config) {
       : [{ base: `http://${ip}:${options.port}`, web: `http://${ip}:${options.proxyPort}` }]
     const lan = lanAll[0]
     const pub = publicUrl ? { base: publicUrl, web: publicUrl } : null
-    const choosePublic = pub && looksPublic(hostHeader)
+    const choosePublic = Boolean(pub) && looksPublic(hostHeader)
     const target = choosePublic ? pub : lan
-    const payload = `dshremote://pair?v=1&name=${encodeURIComponent(os.hostname())}&base=${encodeURIComponent(target.base)}&web=${encodeURIComponent(target.web)}&token=${token}`
+    // 二维码里同时带局域网与公网：手机在同一个 Wi-Fi 就直连，出了门自动改走隧道。
+    // 只编码一个地址的话，换个网络就得重新扫码。
+    const payload = [
+      'dshremote://pair?v=1',
+      `&name=${encodeURIComponent(os.hostname())}`,
+      `&base=${encodeURIComponent(lan.base)}`,
+      `&web=${encodeURIComponent(lan.web)}`,
+      pub ? `&tunnel=${encodeURIComponent(pub.base)}` : '',
+      `&token=${token}`,
+    ].join('')
     return { name: os.hostname(), lan, lanAll, public: pub, target, payload }
   }
 
@@ -257,6 +266,7 @@ export function apply(ctx, config) {
       lan: info.lan,
       lanAll: info.lanAll,
       public: info.public,
+      tunnel: info.public ? info.public.base : '',
       proxyPort: options.proxyPort,
     }
   }

@@ -168,7 +168,33 @@ struct Index {
     await this.saveAndEnter();
   }
 
+  /**
+   * 同时存着局域网和公网地址时，先花 2 秒试一下局域网：
+   * 通了就直连（快、不绕公网），不通就自动改走隧道（换个网络也不用重新扫码）。
+   */
+  private async pickTransport(): Promise<void> {
+    if (this.cfg.host.length === 0) {
+      return;
+    }
+    const probe = await BridgeHttp.health(this.cfg.lanBase(), 2000);
+    const lanAlive = probe.startsWith('桥 ');
+    if (lanAlive) {
+      // 局域网通的时候顺手问一下桥现在的公网地址：电脑重启后隧道地址会变，这里自愈。
+      const tunnel = await BridgeHttp.pairInfo(this.cfg.lanBase());
+      if (tunnel.length > 0 && tunnel !== this.cfg.tunnel) {
+        this.cfg.tunnel = tunnel;
+        this.tunnelInput = tunnel;
+      }
+      this.cfg.preferTunnel = false;
+    } else if (this.cfg.tunnelUrl().length > 0) {
+      this.cfg.preferTunnel = true;
+      this.statusText = '局域网连不上，改走隧道…';
+    }
+    await ConfigStore.save(this.cfg);
+  }
+
   private async enterMain(): Promise<void> {
+    await this.pickTransport();
     const lanBase = this.cfg.webUrl();
     this.webReady = false;
     this.discovery.stop();

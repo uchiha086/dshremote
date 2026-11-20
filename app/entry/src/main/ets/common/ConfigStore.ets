@@ -7,25 +7,37 @@ export class BridgeConfig {
   port: number = 3088;
   token: string = '';
   proxyPort: number = 7627;
-  /** 隧道地址（https://xxx.trycloudflare.com），填了就走公网，忽略 host/port/proxyPort。 */
+  /** 隧道地址（https://xxx.trycloudflare.com）；和局域网地址可以同时存在。 */
   tunnel: string = '';
+  /** 两个地址都在时，true 走隧道、false 走局域网。进主界面前会自动探测一次。 */
+  preferTunnel: boolean = false;
+
+  /** 局域网直连的桥接口地址。 */
+  lanBase(): string {
+    return `http://${this.host}:${this.port}`;
+  }
+
+  /** 局域网直连的 DSH 网页地址。 */
+  lanWebUrl(): string {
+    return `http://${this.host}:${this.proxyPort}/`;
+  }
 
   /** 桥插件自己的 HTTP 接口（/health、/events、/auth/cookie）的根地址。 */
   baseUrl(): string {
     const tunnel = this.tunnelUrl();
-    if (tunnel.length > 0) {
+    if (tunnel.length > 0 && (this.preferTunnel || this.host.length === 0)) {
       return tunnel;
     }
-    return `http://${this.host}:${this.port}`;
+    return this.lanBase();
   }
 
   /** 塞进 WebView 的 DSH 首页地址。 */
   webUrl(): string {
     const tunnel = this.tunnelUrl();
-    if (tunnel.length > 0) {
+    if (tunnel.length > 0 && (this.preferTunnel || this.host.length === 0)) {
       return `${tunnel}/`;
     }
-    return `http://${this.host}:${this.proxyPort}/`;
+    return this.lanWebUrl();
   }
 
   /** 去掉结尾斜杠；不是合法 http(s) 地址就返回空串。 */
@@ -54,6 +66,7 @@ const KEY_PORT: string = 'port';
 const KEY_TOKEN: string = 'token';
 const KEY_PROXY_PORT: string = 'proxyPort';
 const KEY_TUNNEL: string = 'tunnel';
+const KEY_PREFER_TUNNEL: string = 'preferTunnel';
 
 /** 用 Preferences 持久化配置，App 重启后不用重新配对。 */
 export class ConfigStore {
@@ -76,6 +89,7 @@ export class ConfigStore {
     cfg.token = String(await store.get(KEY_TOKEN, ''));
     cfg.proxyPort = Number(await store.get(KEY_PROXY_PORT, 7627));
     cfg.tunnel = String(await store.get(KEY_TUNNEL, ''));
+    cfg.preferTunnel = Boolean(await store.get(KEY_PREFER_TUNNEL, false));
     return cfg;
   }
 
@@ -89,6 +103,7 @@ export class ConfigStore {
     await store.put(KEY_TOKEN, cfg.token);
     await store.put(KEY_PROXY_PORT, cfg.proxyPort);
     await store.put(KEY_TUNNEL, cfg.tunnel);
+    await store.put(KEY_PREFER_TUNNEL, cfg.preferTunnel);
     await store.flush();
   }
 
@@ -102,6 +117,7 @@ export class ConfigStore {
     await store.delete(KEY_TOKEN);
     await store.delete(KEY_PROXY_PORT);
     await store.delete(KEY_TUNNEL);
+    await store.delete(KEY_PREFER_TUNNEL);
     await store.flush();
   }
 }
