@@ -17,11 +17,12 @@ local.properties
 node_modules/
 *.tgz
 
-# Android（命令行构建产物）
+# 安卓（命令行构建产物）
 android/build/
 android/gen/
 android/classes/
 android/*.apk
+android/*.idsig
 android/debug.keystore
 
 # 系统 / 编辑器
@@ -34,7 +35,6 @@ Thumbs.db
 bridge/test/*.log
 bridge/test/*.token
 bridge/test/*.hosts
-android/*.idsig
 
 # 自测临时目录
 /test/

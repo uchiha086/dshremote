@@ -10,7 +10,6 @@
 [![HarmonyOS NEXT](https://img.shields.io/badge/HarmonyOS%20NEXT-API%2026-000000)](https://developer.huawei.com/consumer/cn/harmonyos/)
 [![Android](https://img.shields.io/badge/Android-7.0%2B-3DDC84)](https://developer.android.com/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/uchiha086/dshremote?color=orange)](https://github.com/uchiha086/dshremote/releases)
 
 <img src="docs/icon.png" width="128" alt="DSH Remote 图标">
 
@@ -60,17 +59,24 @@ DSH 是个桌面版 Agent，人离开了电脑就没法盯进度。现有的远�
         局域网：http://<pc-ip>:7627        公网：https://xxx.trycloudflare.com
 ```
 
-## 下载与安装
+## 获取方式：只发源码，不发二进制
 
-最新版本见 [Releases](https://github.com/uchiha086/dshremote/releases)：
+本仓库**不提供预编译的 HAP / APK**，请自行构建（或按下方说明签名）。原因很实在：
 
-| 包 | 平台 | 安装 |
-|---|---|---|
-| `dshremote-harmony-<ver>.hap` | HarmonyOS NEXT | `hdc install dshremote-harmony-0.2.0.hap` |
-| `dshremote-android-<ver>.apk` | Android 7.0+ | 允许「安装未知来源」后直接装 |
-| `dshremote-bridge-<ver>.zip` | 电脑端插件 | 解压 → plugin_manager 安装该目录 → 重启 Desktop |
+- 鸿蒙包用的是**开发签名**，证书绑定了签名人自己的设备 UDID（`debug-info.device-ids` 只有一台），换设备、换人一律装不上，发出来对别人没有意义；
+- 安卓包是 debug keystore 自签，谁都能装但也不该由我代发；
+- 想给别人用，正确做法是**各自用自己账号签名**，或走 AppGallery 正式分发。
 
-> 目前都是自签包：鸿蒙是 DevEco 调试证书，安卓是 debug keystore，未上架任何应用商店。
+三步走：
+
+```powershell
+git clone https://github.com/uchiha086/dshremote.git
+cd dshremote
+# 1) 电脑端插件：把 bridge/ 装进 DSH profile，重启 Desktop
+# 2) 手机端：见下节「自己构建」
+```
+
+> 完整的安装、构建、签名（鸿蒙 + 安卓）、常见故障处理：**[docs/使用与签名.md](docs/使用与签名.md)**
 
 ## 三步开始
 
@@ -90,7 +96,7 @@ bridge/      电脑端插件（零依赖 ESM）：反代、配对、体检、隧
 app/         鸿蒙 HarmonyOS NEXT 客户端（ArkTS）
 android/     安卓客户端（纯 Java，命令行 aapt2/d8/apksigner 构建）
 tools/       tunnel.ps1（起隧道并登记）、图标生成
-docs/        使用说明、截图
+docs/        使用说明、使用与签名、图标
 ```
 
 ## 自己构建

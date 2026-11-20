@@ -1,10 +1,17 @@
 # Build a signed DSH Remote APK with the plain command line toolchain (no Gradle).
-# Requires: C:\Users\user\android-sdk with build-tools 34.0.0, and JDK at E:\dev\DevEco Studio\jbr
+# Requires: Android SDK with build-tools 34.0.0 + platform android-34, and any JDK 17+.
 param(
-  [string]$Sdk = 'C:\Users\user\android-sdk',
-  [string]$Jdk = 'E:\dev\DevEco Studio\jbr',
+  [string]$Sdk = $(if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT }
+                   elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME }
+                   else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }),
+  [string]$Jdk = $(if ($env:JAVA_HOME) { $env:JAVA_HOME }
+                   else { Join-Path $env:LOCALAPPDATA 'Programs\Android Studio\jbr' }),
   [string]$VersionName = '0.2.0',
-  [int]$VersionCode = 3
+  [int]$VersionCode = 3,
+  [string]$KsPath = '',
+  [string]$KsAlias = 'dshremote',
+  [string]$KsPass = 'dshremote',
+  [string]$KsKeyPass = 'dshremote'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -76,15 +83,15 @@ Write-Host '== zipalign'
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed' }
 
 Write-Host '== sign'
-$ks = Join-Path $here 'debug.keystore'
+$ks = if ($KsPath) { $KsPath } else { Join-Path $here 'debug.keystore' }
 if (-not (Test-Path $ks)) {
-  & $keytool -genkeypair -keystore $ks -alias dshremote -keyalg RSA -keysize 2048 -validity 10000 `
-    -storepass dshremote -keypass dshremote -dname "CN=DSH Remote, O=dshremote, C=CN" 2>&1 | Out-Null
+  & $keytool -genkeypair -keystore $ks -alias $KsAlias -keyalg RSA -keysize 2048 -validity 10000 `
+    -storepass $KsPass -keypass $KsKeyPass -dname "CN=DSH Remote, O=dshremote, C=CN" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'keytool failed' }
 }
 $final = Join-Path $here ("dshremote-android-{0}.apk" -f $VersionName)
 if (Test-Path $final) { Remove-Item $final -Force }
-& $java -jar $apksigner sign --ks $ks --ks-pass pass:dshremote --key-pass pass:dshremote `
+& $java -jar $apksigner sign --ks $ks --ks-key-alias $KsAlias --ks-pass "pass:$KsPass" --key-pass "pass:$KsKeyPass" `
   --out $final (Join-Path $out 'app-aligned.apk')
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
 
