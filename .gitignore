@@ -1,0 +1,23 @@
+# 鸿蒙 / DevEco
+build/
+.hvigor/
+oh_modules/
+*.hap
+*.har
+*.hsp
+local.properties
+.idea/
+*.p12
+*.cer
+*.p7b
+*.csr
+
+# 电脑侧插件
+node_modules/
+*.tgz
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
