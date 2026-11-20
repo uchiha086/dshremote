@@ -5,6 +5,7 @@ import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { svgOf } from './qr.mjs'
 import { createWebSocketServer } from './websocket.mjs'
 
@@ -44,6 +45,11 @@ const DEFAULT_OPTIONS = {
   // 局域网自动发现：往 3089 端口广播自己，手机 App 监听即可自动列出电脑，不用手填 IP。
   discovery: true,
   discoveryPort: 3089,
+  // 隧道：auto = 由桥自己拉起 cloudflared 快速隧道并守护重启，off = 手动跑 tools/tunnel.ps1。
+  tunnel: 'off',
+  cloudflaredPath: 'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
+  tunnelProtocol: 'http2',
+  tunnelWaitMs: 60_000,
 }
 
 /** 读已保存的 token；只认长十六进制串，避免把脏内容当口令用。 */
@@ -900,6 +906,78 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     })
   }
 
+  // ---- 隧道守护 ----
+  // 以前靠 tools/tunnel.ps1 手动跑 cloudflared，它一被父进程带走、或者 DNS 抖一下退出，
+  // 手机在 4G 就连不上了。这里改成由宿主进程负责拉起与重启，掉线会自动恢复。
+  let tunnelChild = null
+  let tunnelTimer = null
+  let tunnelAttempt = 0
+  let tunnelStopped = false
+
+  function scheduleTunnel(delayMs) {
+    if (tunnelStopped || tunnelTimer) return
+    tunnelTimer = setTimeout(() => {
+      tunnelTimer = null
+      startTunnel()
+    }, delayMs)
+    if (typeof tunnelTimer.unref === 'function') tunnelTimer.unref()
+  }
+
+  function adoptTunnelUrl(url) {
+    const clean = String(url).replace(/\/+$/, '')
+    if (!/^https:\/\//.test(clean) || clean === publicUrl) return
+    publicUrl = clean
+    trustHost(clean.replace(/^https?:\/\//, '').split('/')[0].toLowerCase())
+    writePublicUrl(publicUrl)
+    tunnelAttempt = 0
+    log(`隧道就绪 ${publicUrl}`)
+  }
+
+  function startTunnel() {
+    if (tunnelStopped || tunnelChild) return
+    if (String(options.tunnel ?? 'off') !== 'auto') return
+    const exe = String(options.cloudflaredPath ?? '')
+    if (!exe || !fs.existsSync(exe)) {
+      log(`隧道未启动：找不到 cloudflared（${exe}）`)
+      return
+    }
+    const args = [
+      'tunnel',
+      '--url', `http://127.0.0.1:${options.port}`,
+      '--protocol', String(options.tunnelProtocol ?? 'http2'),
+      '--no-autoupdate',
+      '--loglevel', 'info',
+    ]
+    let child
+    try {
+      child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      log(`隧道启动失败：${error?.message ?? error}`)
+      scheduleTunnel(10_000)
+      return
+    }
+    tunnelChild = child
+    log(`隧道启动中 pid=${child.pid}`)
+
+    const onData = (chunk) => {
+      for (const line of String(chunk).split(/\r?\n/)) {
+        const match = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+        if (match) adoptTunnelUrl(match[0])
+      }
+    }
+    child.stdout?.on('data', onData)
+    child.stderr?.on('data', onData)
+    child.on('error', (error) => log(`隧道进程错误：${error?.message ?? error}`))
+    child.on('exit', (code) => {
+      tunnelChild = null
+      if (tunnelStopped) return
+      tunnelAttempt += 1
+      const delay = Math.min(60_000, 5_000 * tunnelAttempt)
+      log(`隧道进程退出 code=${code}，${Math.round(delay / 1000)}s 后重启`)
+      scheduleTunnel(delay)
+    })
+  }
+
   ctx.effect(() => {
     void (async () => {
       await listen(server, options.port, options.bind, 'bridge')
@@ -916,11 +994,22 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         log(`token 落盘失败：${error?.message ?? error}`)
       }
       log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'} trusted=${Array.isArray(trustedList) ? trustedList.length : 'no'}`)
+      startTunnel()
     })()
 
     return () => {
       clearInterval(heartbeat)
       clearInterval(beaconTimer)
+      tunnelStopped = true
+      if (tunnelTimer) {
+        clearTimeout(tunnelTimer)
+        tunnelTimer = null
+      }
+      try {
+        tunnelChild?.kill()
+      } catch {
+        // 杀不掉就交给系统回收。
+      }
       try {
         beaconSocket?.close()
       } catch {
