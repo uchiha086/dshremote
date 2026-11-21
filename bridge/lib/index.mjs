@@ -1382,7 +1382,12 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
    */
   function tunnelHint() {
     const state = tunnelState()
-    if (state.mode !== 'auto') return `未启用：config.tunnel 现在是 ${state.mode}，改成 auto 后重启 Desktop`
+    if (state.mode !== 'auto') {
+      if (state.url) {
+        return `固定地址模式：${state.url}`
+      }
+      return `未启用：config.tunnel 现在是 ${state.mode}，要快速隧道就改成 auto，要固定地址就填 publicUrl`
+    }
     if (!state.exeOk) return `未启用：找不到 cloudflared（cloudflaredPath=${state.exe || '空'}）`
     if (state.running) {
       const waited = state.startedAt > 0 ? Math.round((Date.now() - state.startedAt) / 1000) : 0
@@ -1442,6 +1447,32 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     })
   }
 
+  /**
+   * 固定公网地址模式（如 Tailscale Funnel）：地址由外部服务提供、永远不会变，
+   * 所以不启用 cloudflared，只在启动后回打一次 /health 自证可用，再交给 watchTunnel 定时复核。
+   */
+  function verifyConfiguredPublic(attempt = 1) {
+    if (tunnelStopped || String(options.tunnel ?? 'off') === 'auto') return
+    if (!publicUrl) return
+    const authority = tunnelAuthority(publicUrl)
+    if (!authority) return
+    verifyTunnel(publicUrl, authority).then((ok) => {
+      if (ok) {
+        tunnelVerifiedAt = Date.now()
+        tunnelWatchMisses = 0
+        trustHost(authority)
+        log(`公网地址=${publicUrl}（固定地址模式，已回打校验）`)
+        return
+      }
+      if (attempt >= 5) {
+        log(`固定公网地址校验失败：${publicUrl}（会每 60 秒再试；检查 Tailscale Funnel 是否还开着）`)
+        return
+      }
+      const timer = setTimeout(() => verifyConfiguredPublic(attempt + 1), 3000 * attempt)
+      if (typeof timer.unref === 'function') timer.unref()
+    })
+  }
+
   /** 每 60 秒复核一次已发布的隧道：域名会被 Cloudflare 回收，回收后要立刻停止再用它。 */
   function watchTunnel() {
     if (tunnelWatch || tunnelStopped) return
@@ -1464,7 +1495,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           log(`隧道 ${publicUrl} 已失效，等待新地址`)
         }
         tunnelVerifiedAt = 0
-        if (tunnelChild) {
+        if (tunnelChild && String(options.tunnel ?? 'off') === 'auto') {
           log('隧道域名疑似被回收，重启 cloudflared 换新地址')
           try {
             tunnelChild.kill()
@@ -1618,6 +1649,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
       log(`就绪 token=${token} 上游=127.0.0.1:${upstreamPort} browserAuth=${browserAuth ? 'yes' : 'no'} trusted=${Array.isArray(trustedList) ? trustedList.length : 'no'}`)
       startTunnel()
       watchTunnel()
+      verifyConfiguredPublic()
     })()
 
     return () => {

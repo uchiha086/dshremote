@@ -6,30 +6,45 @@
       name: dshremote-bridge
       config:
         enabled: true
+
+        # 手机连的桥端口（局域网 http://<电脑IP>:3088）。
         port: 3088
         bind: 0.0.0.0
+
+        # 为空则沿用 ~/.dsh/dshremote-bridge.token；这个值重启后不会变，手机配一次就行。
         token: ''
+
+        # DSH Web 只监听回环，这里由桥在 7627 上做一层反向代理给手机用。
         proxyEnabled: true
         proxyPort: 7627
         upstreamHost: 127.0.0.1
         upstreamPort: 7626
+
+        # 通知正文长度。
         answerHeadChars: 120
         questionChars: 200
+
+        # 空 = ~/.dsh/dshremote-bridge.log
         logFile: ''
-        # 隧道/公网的 host 写这里（或用 GET /trust?token=…&host=… 运行时登记），
-        # 都会被塞进 DSH 的 trustedHosts，否则公网访问会被 403 forbidden。
-        extraHosts: []
-        hostsFile: ''
-        # 当前对外的公网地址（例如 Cloudflare 隧道域名）。二维码和自动发现都会带上它；
-        # 隧道地址每次重启会变，所以运行时用 GET /public?token=…&url=… 更新即可，自动落盘。
-        publicUrl: ''
+
+        # 固定公网地址：Tailscale Funnel 给的 https://<电脑名>.<tailnet>.ts.net
+        # 配合下面的 tunnel: off 使用：不再拉 cloudflared 快速隧道，地址永久不变。
+        publicUrl: 'https://dsremote.tail5382cc.ts.net'
         publicUrlFile: ''
-        # 局域网自动发现：每 2 秒向 255.255.255.255:3089 广播「我是谁、在哪、口令」，
-        # 手机 App 监听同一端口就能免手填直接连。不想暴露就设成 false。
-        discovery: true
+
+        # 额外的可信 host（公网域名），会被塞进 DSH 的 trustedHosts，否则公网访问 403。
+        extraHosts:
+          - dsremote.tail5382cc.ts.net
+        hostsFile: ''
+
+        # 局域网自动发现：每 2 秒向 255.255.255.255:3089 广播「我是谁、在哪、端口」，
+        # 手机 App 监听同一端口就能免手填直连。不想暴露就设成 false。
+        discovery: false
         discoveryPort: 3089
-        # 隧道：auto = 由桥自己拉起 cloudflared 快速隧道，进程挂了自动重启（推荐）；
-        # off = 不自动起，需要时手动跑 tools/tunnel.ps1。
-        tunnel: auto
+
+        # 隧道：
+        #   auto = 由桥自己拉起 cloudflared 快速隧道（地址每次变，进程挂了自动重启）
+        #   off  = 不自动起（配合上面的 publicUrl 用固定地址，如 Tailscale Funnel）
+        tunnel: off
         cloudflaredPath: 'C:\Program Files (x86)\cloudflared\cloudflared.exe'
         tunnelProtocol: http2
