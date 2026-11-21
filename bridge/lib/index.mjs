@@ -921,14 +921,39 @@ export function apply(ctx, config) {
   }
 
   /** 非 /ws 的 WebSocket 升级（DSH 自己的长连接）也照原样透传。 */
-  function proxyUpgrade(request, socket, head) {
+  // WebSocket 升级反代：隧道场景下手机 WebView 的 wss 请求可能不带 cookie
+  // （ArkWeb 对页面导航和 WebSocket 用不同的 cookie 判据），DSH 会 401 掉整条连接。
+  // 桥本来就持有 token，这里在服务端补一个 cookie 进去，避免页面白屏。
+  const wsCookieCache = new Map()
+  function mintUpgradeCookie(authority) {
+    const hit = wsCookieCache.get(authority)
+    if (hit && Date.now() - hit.at < 10 * 60 * 1000) return Promise.resolve(hit.cookie)
+    const browserAuth = ctx.connection?.browserAuth
+    if (!browserAuth || typeof browserAuth.authenticatedUrl !== 'function') return Promise.resolve('')
+    let authedUrl
+    try {
+      authedUrl = browserAuth.authenticatedUrl(`http://${authority}/`)
+    } catch {
+      return Promise.resolve('')
+    }
+    return fetchAuthCookie(authedUrl, authority).then((cookie) => {
+      if (cookie) wsCookieCache.set(authority, { cookie, at: Date.now() })
+      return cookie
+    })
+  }
+
+  function proxyUpgrade(request, socket, head, injectedCookie = '') {
     const upstream = net.connect({ host: options.upstreamHost, port: upstreamPort }, () => {
       const lines = [`${request.method} ${request.url} HTTP/1.1`]
       for (let i = 0; i < request.rawHeaders.length; i += 2) {
         lines.push(`${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}`)
       }
+      if (injectedCookie) lines.push(`cookie: ${injectedCookie}`)
       upstream.write(`${lines.join('\r\n')}\r\n\r\n`)
       if (head && head.length > 0) upstream.write(head)
+      upstream.once('data', (chunk) => {
+        log(`WS 上游响应 ${String(chunk).split('\r\n')[0]}`)
+      })
       socket.pipe(upstream).pipe(socket)
     })
     const close = () => {
@@ -939,6 +964,21 @@ export function apply(ctx, config) {
     upstream.on('error', (error) => {
       log(`WS 反代上游错误 ${error?.message ?? error}`)
       close()
+    })
+  }
+
+  function proxyUpgradeWithCookie(request, socket, head) {
+    const host = String(request.headers.host ?? '')
+    const suffix = `${host}${request.url ?? ''}`
+    const hasCookie = String(request.headers.cookie ?? '').length > 0
+    if (hasCookie) {
+      log(`WS 升级 ${suffix} cookie=client`)
+      proxyUpgrade(request, socket, head)
+      return
+    }
+    mintUpgradeCookie(host.toLowerCase()).then((minted) => {
+      log(`WS 升级 ${suffix} cookie=${minted ? 'injected' : 'none'}`)
+      proxyUpgrade(request, socket, head, minted)
     })
   }
 
@@ -1387,7 +1427,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
   // 两个客户端都走 HTTP 轮询，桥不再自己实现 WebSocket 服务端（手写 RFC6455 的攻击面不值当）。
   // 升级请求一律按老行为反代给 DSH。
   server.on('upgrade', (request, socket, head) => {
-    proxyUpgrade(request, socket, head)
+    proxyUpgradeWithCookie(request, socket, head)
   })
 
   // DSH Web 只监听回环，手机访问不到；这里做一层裸 TCP 反代。

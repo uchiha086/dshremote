@@ -10,13 +10,13 @@ import { apply } from '../lib/index.mjs';
 const token = 'testtoken0123456789abcdef';
 const config = {
   enabled: true,
-  port: 3298,
+  port: 38981,
   bind: '127.0.0.1',
   token,
   proxyEnabled: true,
-  proxyPort: 3299,
+  proxyPort: 38982,
   upstreamHost: '127.0.0.1',
-  upstreamPort: 3297,
+  upstreamPort: 38980,
   answerHeadChars: 120,
   questionChars: 200,
   // 日志也写临时文件：别把测试实例的启动记录混进真桥的 ~/.dsh/dshremote-bridge.log。
@@ -29,7 +29,7 @@ const config = {
   extraHosts: [],
   hostsFile: path.join(os.tmpdir(), 'dshremote-fixed-test.hosts'),
   discovery: false,
-  discoveryPort: 3290,
+  discoveryPort: 38983,
   tunnel: 'off',
   cloudflaredPath: 'C:\\nothing\\cloudflared.exe',
 };
@@ -37,7 +37,7 @@ const config = {
 const cleanups = [];
 const ctx = {
   connection: { trustedHosts: [], createPeer: () => ({}) },
-  webServer: { port: 3297, register: () => () => {} },
+  webServer: { port: 38980, register: () => () => {} },
   typertGateway: {},
   effect: (fn) => { const d = fn(); if (typeof d === 'function') cleanups.push(d); },
   on: () => () => {},
