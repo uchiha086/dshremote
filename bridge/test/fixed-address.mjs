@@ -17,7 +17,8 @@ const config = {
   upstreamPort: 3297,
   answerHeadChars: 120,
   questionChars: 200,
-  logFile: '',
+  // 日志也写临时文件：别把测试实例的启动记录混进真桥的 ~/.dsh/dshremote-bridge.log。
+  logFile: path.join(os.tmpdir(), 'dshremote-fixed-test.log'),
   publicUrl: 'https://dsremote.tail5382cc.ts.net',
   publicUrlFile: path.join(os.tmpdir(), 'dshremote-fixed-test.public'),
   // 必须显式给临时 tokenFile：否则桥会把测试用 token 写进 ~/.dsh/dshremote-bridge.token，
