@@ -77,8 +77,11 @@ try {
 $publicUrl = "http://127.0.0.1:$BridgePort/public?token=$Token&url=$([uri]::EscapeDataString($url))"
 $published = 'no'
 try {
-  $resp = Invoke-WebRequest -Uri $publicUrl -UseBasicParsing -TimeoutSec 10
-  $published = if ($resp.StatusCode -eq 200) { 'yes' } else { "HTTP $($resp.StatusCode)" }
+  # /public 现在总是回 200（校验失败回 verified:false），所以要看 body，不能只看状态码。
+  # 回打公网 /health 最长可能要十几秒，超时给足。
+  $resp = Invoke-WebRequest -Uri $publicUrl -UseBasicParsing -TimeoutSec 45
+  $pubBody = $resp.Content | ConvertFrom-Json
+  $published = if ($pubBody.verified) { 'yes' } else { "校验未通过（$($pubBody.error)）" }
 } catch {
   $published = "失败：$($_.Exception.Message)"
 }

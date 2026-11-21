@@ -479,6 +479,112 @@ export function apply(ctx, config) {
     }
   }
 
+  // 固定公网域名（Tailscale Funnel、自己的域名）没有 Cloudflare 的边缘 IP 可钉，但本机 DNS
+  // 对它们照样会抖：解析要么超时、要么偶发 NXDOMAIN，而域名本身一直是好的。所以给这类域名
+  // 留一份"上次解析成功的 IP"：DNS 打不通时直接复用，SNI/Host 仍是原域名，证书校验不受影响。
+  const publicIpCache = new Map()
+  const PUBLIC_IP_TTL_MS = 10 * 60 * 1000
+  // 解析结果落盘：重启 Desktop 后本机 DNS 往往还没回暖，先把上次打通的入口 IP 捞回来用，
+  // 免得固定地址被误判成"隧道挂了"。文件名跟 token/hosts 放同一个目录。
+  const publicIpFile = path.join(STORE_DIR, 'dshremote-bridge.public-ip.json')
+
+  function loadPublicIps() {
+    try {
+      if (!fs.existsSync(publicIpFile)) return
+      const parsed = JSON.parse(fs.readFileSync(publicIpFile, 'utf8'))
+      if (!parsed || typeof parsed !== 'object') return
+      for (const [host, entry] of Object.entries(parsed)) {
+        const ip = String(entry?.ip ?? '').trim()
+        const at = Number(entry?.at ?? 0)
+        if (!host || !ip || ip.startsWith('100.')) continue
+        if (Date.now() - at > PUBLIC_IP_TTL_MS) continue
+        publicIpCache.set(String(host).toLowerCase(), { ip, at })
+      }
+    } catch {
+      // 缓存坏了不影响主流程，下一轮解析成功会重写。
+    }
+  }
+
+  function savePublicIps() {
+    try {
+      const out = Object.fromEntries(publicIpCache)
+      fs.mkdirSync(path.dirname(publicIpFile), { recursive: true })
+      fs.writeFileSync(publicIpFile, JSON.stringify(out), { encoding: 'utf8', mode: 0o600 })
+    } catch {
+      // 写不进去就算了，只是少了冷启动加速。
+    }
+  }
+
+  function rememberPublicIp(hostname, address) {
+    const host = String(hostname ?? '').toLowerCase()
+    const ip = String(address ?? '').trim()
+    if (!host || !ip || ip.startsWith('100.')) return
+    publicIpCache.set(host, { ip, at: Date.now() })
+    savePublicIps()
+  }
+
+  function cachedPublicIp(hostname) {
+    const host = String(hostname ?? '').toLowerCase()
+    const hit = publicIpCache.get(host)
+    if (!hit) return ''
+    if (Date.now() - hit.at > PUBLIC_IP_TTL_MS) {
+      publicIpCache.delete(host)
+      savePublicIps()
+      return ''
+    }
+    return hit.ip
+  }
+
+  function forgetPublicIp(hostname) {
+    if (publicIpCache.delete(String(hostname ?? '').toLowerCase())) savePublicIps()
+  }
+
+  loadPublicIps()
+
+  /** 固定公网域名专用 lookup：先系统 DNS，失败/超时退回上次解析成功的 IP；force 时直接用缓存。 */
+  function publicHostLookup(hostname, { force = false } = {}) {
+    return (host, options, callback) => {
+      const opts = typeof options === 'function' ? {} : (options ?? {})
+      const cb = typeof options === 'function' ? options : callback
+      const answer = (address) => {
+        if (opts.all) cb(null, [{ address, family: 4 }])
+        else cb(null, address, 4)
+      }
+      if (force) {
+        const pinned = cachedPublicIp(hostname)
+        if (pinned) {
+          answer(pinned)
+          return
+        }
+      }
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        const pinned = cachedPublicIp(hostname)
+        if (pinned) answer(pinned)
+        else cb(Object.assign(new Error(`dns timeout: ${hostname}`), { code: 'ENOTFOUND' }))
+      }, 1500)
+      if (typeof timer.unref === 'function') timer.unref()
+      dns.lookup(hostname, { family: 4 }, (error, address) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (!error && address) {
+          rememberPublicIp(hostname, address)
+          answer(address)
+          return
+        }
+        const pinned = cachedPublicIp(hostname)
+        if (pinned) {
+          answer(pinned)
+          return
+        }
+        cb(error || Object.assign(new Error(`dns failed: ${hostname}`), { code: 'ENOTFOUND' }))
+      })
+    }
+  }
+
   /** 单个 HTTP 探测：2xx/3xx/401 都算"通了"（401 说明 DSH 在跑，只是还没登录）。 */
   function probe(urlString, name) {
     return new Promise((resolve) => {
@@ -487,6 +593,8 @@ export function apply(ctx, config) {
         const target = new URL(urlString)
         const secure = target.protocol === 'https:'
         const tunnelHost = secure && isTunnelHost(target.hostname)
+        // 固定公网域名（Tailscale Funnel 等）没有边缘 IP 可钉，改用"上次解析成功的 IP"兜底。
+        const fixedPublicHost = secure && !tunnelHost && looksPublic(target.hostname)
         const attempt = (force) => new Promise((settle) => {
           const request = (secure ? https : http).request({
             host: target.hostname,
@@ -496,7 +604,9 @@ export function apply(ctx, config) {
             timeout: 8000,
             headers: { host: target.host, accept: 'application/json,text/html' },
             ...(tunnelHost ? { lookup: tunnelLookup(target.hostname, { force }) } : {}),
+            ...(fixedPublicHost ? { lookup: publicHostLookup(target.hostname, { force }) } : {}),
           }, (response) => {
+            if (fixedPublicHost) rememberPublicIp(target.hostname, response.socket?.remoteAddress)
             let body = ''
             response.setEncoding('utf8')
             response.on('data', (chunk) => { body += chunk })
@@ -511,9 +621,14 @@ export function apply(ctx, config) {
           request.on('error', (error) => settle({ ok: false, detail: error?.code ?? String(error?.message ?? error) }))
           request.end()
         })
-        // 隧道流量：系统 DNS 这轮没打通，就钉死边缘 IP 再打一次——本机 DNS 抖动时这是唯一稳的路。
-        const flow = tunnelHost
-          ? attempt(false).then((first) => (first.ok ? first : attempt(true)))
+        // 隧道/固定公网域名：系统 DNS 这轮没打通，就换条路再打一次，别把好地址误判成红。
+        const retryable = tunnelHost || fixedPublicHost
+        const flow = retryable
+          ? attempt(false).then((first) => (first.ok ? first : attempt(true).then((second) => {
+            // 连缓存 IP 也打不通，说明入口换了：把缓存丢掉，下一轮重新解析。
+            if (!second.ok && fixedPublicHost) forgetPublicIp(target.hostname)
+            return second
+          })))
           : attempt(false)
         flow.then((result) => resolve({ name, ok: result.ok, ms: Date.now() - started, detail: result.detail }))
       } catch (error) {
@@ -766,7 +881,7 @@ export function apply(ctx, config) {
 
   /** 把非桥自身路由的请求原样转给 DSH。
    *  Host 头**不改写**：隧道访问时 Host 是公网域名，DSH 的 cookie 与 trustedHosts 都按它来校验。 */
-  function proxyRequest(request, response) {
+  function proxyRequest(request, response, attempt = 1) {
     const headers = { ...request.headers }
     if (!headers.host) headers.host = `${options.upstreamHost}:${upstreamPort}`
     const upstreamRequest = http.request(
@@ -782,11 +897,22 @@ export function apply(ctx, config) {
         upstreamResponse.pipe(response)
       },
     )
+    // DSH 电脑端重启、或者它自己踢 keep-alive 连接时会 ECONNRESET。GET/HEAD 是幂等的，
+    // 悄悄再试一次基本就能过去，用户不会看到一个莫名其妙的 502。
+    const idempotent = request.method === 'GET' || request.method === 'HEAD'
+    const retryable = idempotent && attempt < 3
     upstreamRequest.on('error', (error) => {
-      log(`HTTP 反代上游错误 ${error?.message ?? error}`)
+      const code = String(error?.code ?? '')
+      const why = code || String(error?.message ?? error)
+      log(`HTTP 反代上游错误 ${why} ${request.method} ${request.url}`)
+      if (retryable && (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EPIPE')) {
+        const timer = setTimeout(() => proxyRequest(request, response, attempt + 1), 150 * attempt)
+        if (typeof timer.unref === 'function') timer.unref()
+        return
+      }
       if (!response.headersSent) {
-        response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
-        response.end('bridge: upstream unreachable')
+        response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '1' })
+        response.end('bridge: DSH 上游暂时连不上（电脑端可能正在重启），刷新一下重试')
       } else {
         response.destroy()
       }
@@ -1077,6 +1203,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         }
         const candidate = value.replace(/\/+$/, '')
         // 不采信调用方的自报：自己回打公网 /health，返回 200 且服务名对得上才算"已验证"。
+        // 校验失败不是网关错误（502），只是一个"还没验过"的状态，所以回 200 + verified:false，
+        // 让调用方自己决定怎么提示；真正写进二维码仍然只认 verified 的结果。
         verifyTunnel(candidate, tunnelAuthority(candidate)).then((ok) => {
           if (ok) {
             publicUrl = candidate
@@ -1085,10 +1213,16 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
             trustHost(tunnelAuthority(candidate))
             log(`公网地址=${publicUrl}（已回打校验）`)
           } else {
-            log(`公网地址校验失败，不写进二维码：${candidate}`)
+            log(`公网地址校验失败，暂不写进二维码：${candidate}`)
           }
-          response.writeHead(ok ? 200 : 502, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-          response.end(JSON.stringify({ ok: Boolean(ok), public: publicUrl || null, verified: Boolean(ok) }))
+          response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(JSON.stringify({
+            ok: Boolean(ok),
+            verified: Boolean(ok),
+            public: ok ? publicUrl : (publicUrl || null),
+            candidate,
+            error: ok ? undefined : 'public-unverified',
+          }))
         })
         return
       }
@@ -1496,9 +1630,8 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           return
         }
         tunnelWatchMisses += 1
-        // 连续两次打不通才认死：一次失败可能只是网络抖。真死了就杀掉 cloudflared，
-        // 让退出事件走自动重连，换一条新域名回来。
-        if (tunnelWatchMisses < 2) return
+        // 连续三次打不通才认死：本机 DNS/TLS 抖动很常见，一次失败的代价是把好地址从二维码里撤掉。
+        if (tunnelWatchMisses < 3) return
         tunnelWatchMisses = 0
         if (tunnelVerifiedAt > 0) {
           log(`隧道 ${publicUrl} 已失效，等待新地址`)
@@ -1529,6 +1662,7 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
     const secure = !parsed || parsed.protocol === 'https:'
     const host = String(authority ?? '').replace(/:\d+$/, '')
     const tunnelHost = secure && isTunnelHost(host)
+    const fixedPublicHost = secure && !tunnelHost && looksPublic(host)
     const port = secure ? 443 : Number(parsed?.port || 80)
     const agent = secure ? https : http
     const attempt = (force) => new Promise((resolve) => {
@@ -1547,7 +1681,9 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
           timeout: 8000,
           headers: { host: authority },
           ...(tunnelHost ? { lookup: tunnelLookup(host, { force }) } : {}),
+          ...(fixedPublicHost ? { lookup: publicHostLookup(host, { force }) } : {}),
         }, (response) => {
+          if (fixedPublicHost) rememberPublicIp(host, response.socket?.remoteAddress)
           let body = ''
           response.setEncoding('utf8')
           response.on('data', (chunk) => { body += chunk })
@@ -1560,8 +1696,15 @@ code{font-size:11px;word-break:break-all;background:#1b2438;padding:10px;border-
         done(false)
       }
     })
-    // 系统 DNS 这轮没打通就钉边缘 IP 再验一次，避免把好隧道当成死链丢掉。
-    return attempt(false).then((ok) => (ok || !tunnelHost ? ok : attempt(true)))
+    // 这一轮没打通也别急着判死：Cloudflare 钉边缘 IP、固定公网域名复用上次解析结果，再验一次。
+    const retryable = tunnelHost || fixedPublicHost
+    return attempt(false).then((ok) => {
+      if (ok || !retryable) return ok
+      return attempt(true).then((second) => {
+        if (!second && fixedPublicHost) forgetPublicIp(host)
+        return second
+      })
+    })
   }
 
   function startTunnel() {

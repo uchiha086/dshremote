@@ -118,7 +118,9 @@ const pubJson = await pubRes.json()
 check('GET /public 校验通过后设置成功', pubRes.status === 200 && pubJson.public === PUBLIC_STUB, JSON.stringify(pubJson))
 
 const badPub = await fetch(`${base}/public?token=${TOKEN}&url=https://no-such-host.example/`)
-check('GET /public 校验不通过 → 502', badPub.status === 502, String(badPub.status))
+const badPubJson = await badPub.json()
+// 校验失败只是"还没验过"，不该伪装成网关错误（502）；调用方看 verified:false 自己提示。
+check('GET /public 校验不通过 → 200 + verified:false', badPub.status === 200 && badPubJson.verified === false, `${badPub.status} ${JSON.stringify(badPubJson)}`)
 
 const pairJson2 = await (await fetch(`${base}/pair`)).json()
 check('设置后 payload 仍以局域网为主（回环请求）', pairJson2.base === pairJson.base, pairJson2.base)

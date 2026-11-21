@@ -1,5 +1,7 @@
 // 验证「固定地址模式」：假 ctx 起一个桥实例，tunnel: off + publicUrl 指向真实 Funnel。
 // 断言：不拉 cloudflared；启动后自动回打校验；/pair 带固定地址；局域网地址是手机能连的家宽私网。
+import dns from 'node:dns';
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
@@ -41,6 +43,18 @@ const ctx = {
   on: () => () => {},
 };
 
+// 本机 DNS 对 *.ts.net 会抖（5 次里能超时 2 次）：测试先自己解析一次（最多 15 秒），
+// 把入口 IP 写进桥的"解析缓存"文件，让固定地址校验这条路不依赖当轮 DNS 的运气。
+const funnelHost = 'dsremote.tail5382cc.ts.net';
+let funnelIp = '';
+for (let i = 0; i < 10 && !funnelIp; i += 1) {
+  funnelIp = await new Promise((resolve) => dns.lookup(funnelHost, { family: 4 }, (error, address) => resolve(error ? '' : address)));
+  if (!funnelIp) await new Promise((resolve) => setTimeout(resolve, 1200));
+}
+if (!funnelIp) funnelIp = '208.111.34.11'; // 兜底：最近观测到的 Tailscale Funnel 入口
+const publicIpCacheFile = path.join(os.tmpdir(), 'dshremote-bridge.public-ip.json');
+fs.writeFileSync(publicIpCacheFile, JSON.stringify({ [funnelHost]: { ip: funnelIp, at: Date.now() } }), 'utf8');
+
 apply(ctx, config);
 
 const get = (p) => new Promise((resolve, reject) => {
@@ -81,6 +95,7 @@ check('局域网地址是家宽私网', /^http:\/\/(192\.168|10\.|172\.(1[6-9]|2
 check('局域网地址不是 tailnet 100.x', !/^http:\/\/100\./.test(pair.lan?.base || ''), String(pair.lan?.base));
 
 for (const fn of cleanups) { try { fn(); } catch { /* noop */ } }
+try { fs.unlinkSync(publicIpCacheFile); } catch { /* noop */ }
 
 let failed = 0;
 for (const c of checks) {
