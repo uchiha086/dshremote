@@ -20,6 +20,9 @@ const config = {
   logFile: '',
   publicUrl: 'https://dsremote.tail5382cc.ts.net',
   publicUrlFile: path.join(os.tmpdir(), 'dshremote-fixed-test.public'),
+  // 必须显式给临时 tokenFile：否则桥会把测试用 token 写进 ~/.dsh/dshremote-bridge.token，
+  // 覆盖掉真 token（真发生过一次，导致手机端 401）。
+  tokenFile: path.join(os.tmpdir(), 'dshremote-fixed-test.token'),
   extraHosts: [],
   hostsFile: path.join(os.tmpdir(), 'dshremote-fixed-test.hosts'),
   discovery: false,
