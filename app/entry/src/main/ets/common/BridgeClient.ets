@@ -110,11 +110,14 @@ export class BridgeHttp {
    * 读一次桥的配对信息，主要用来自愈：电脑重启后隧道地址会变，
    * 只要这次能连上局域网，就把新的公网地址带回来更新本地配置。
    */
-  static async pairInfo(baseUrl: string): Promise<string> {
+  static async pairInfo(baseUrl: string, token: string): Promise<string> {
     const client = http.createHttp();
     try {
+      // 0.2.1 起 /pair 对非回环来源要求 token（手机走局域网访问也算非回环），
+      // 不带请求头会 401，自愈就悄悄失效了。
       const response = await client.request(`${baseUrl}/pair`, {
         method: http.RequestMethod.GET,
+        header: { 'X-DSH-Token': token },
         connectTimeout: 4000,
         readTimeout: 6000
       });

@@ -289,7 +289,7 @@ struct Index {
     const probe = await BridgeHttp.health(this.cfg.lanBase(), 2000);
     const lanAlive = probe.startsWith('桥 ');
     if (lanAlive) {
-      const tunnel = await BridgeHttp.pairInfo(this.cfg.lanBase());
+      const tunnel = await BridgeHttp.pairInfo(this.cfg.lanBase(), this.cfg.token);
       if (tunnel.length > 0 && tunnel !== this.cfg.tunnel) {
         this.cfg.tunnel = tunnel;
         this.tunnelInput = tunnel;
