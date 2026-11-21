@@ -230,7 +230,10 @@ export function apply(ctx, config) {
     return new Promise((resolve) => {
       const socket = dgram.createSocket('udp4')
       let settled = false
-      const done = (value) => {
+      const accept = (value) =>
+        /^192\.168\./.test(value) || /^10\./.test(value) || /^172\.(1[6-9]|2\d|3[01])\./.test(value)
+      const done = (raw) => {
+        const value = accept(String(raw ?? "")) ? String(raw) : ""
         if (settled) return
         settled = true
         try {
@@ -255,17 +258,23 @@ export function apply(ctx, config) {
   function lanAddresses() {
     const preferName = [/wlan|wi-?fi|无线/i]
     const avoidName = [/virtualbox|vmware|hyper-v|vethernet|docker|loopback|bluetooth|蓝牙|tap|tun|npcap|tailscale/i]
+    // 手机能连的只有"家宽私网"：192.168/16、10/8、172.16/12。
+    // Tailscale 的 100.64/10、APIPA 的 169.254/16、回环都不算——把它们编进二维码就是死地址。
+    const reachable = (address) =>
+      /^192\.168\./.test(address) || /^10\./.test(address) || /^172\.(1[6-9]|2\d|3[01])\./.test(address)
     const items = []
     try {
       for (const [name, list] of Object.entries(os.networkInterfaces())) {
         for (const item of list ?? []) {
           if (!item || item.family !== 'IPv4' || item.internal) continue
+          if (!reachable(item.address)) continue
+          const virtual = avoidName.some((re) => re.test(name))
           let score = 0
-          if (item.address === primaryIp) score += 100
+          // 默认路由那张网卡优先，但如果它是虚拟网卡（WSL/Hyper-V/VirtualBox）就不加分。
+          if (item.address === primaryIp && !virtual) score += 100
           if (preferName.some((re) => re.test(name))) score += 10
-          if (avoidName.some((re) => re.test(name))) score -= 10
+          if (virtual) score -= 10
           if (/^192\.168\./.test(item.address)) score += 3
-          if (/^169\.254\./.test(item.address)) score -= 5
           items.push({ address: item.address, score })
         }
       }
