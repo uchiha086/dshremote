@@ -10,7 +10,7 @@
 |---|---|
 | 文件 | `dshremote-android-0.2.2.apk` |
 | 大小 | 41,446 B |
-| SHA-256 | `B194E9C26A73A333FA6AE66CCE2339B1F2B2B6382312542D71447B1163E27DC1` |
+| SHA-256 | `8F588831B5B01AF5DE586AA7926047C4B1A463A1AE896C6BC5D98E2875390A7C` |
 | 包名 | `com.dshremote.app` |
 | 版本 | versionCode 5 / versionName 0.2.2 |
 | 系统要求 | **Android 7.0+**（minSdk 24，targetSdk 34） |
@@ -52,7 +52,8 @@ cd dshremote/android
 ## 这一次的改动
 
 - 安卓客户端首发：设置页（粘贴配对链接/手动）、全屏 WebView、右上角齿轮、回合结束本地通知、前台服务保活、`dshremote://pair` 深链。
-- 与电脑端 `dshremote-bridge` 0.2.1 配套：`/auth/cookie` 免登录注入、`/events` 的 `afterSeq` 游标、五项环境体检、一次性配对码 `/pair/claim`。
+- 与电脑端 `dshremote-bridge` 0.2.2 配套：`/auth/cookie` 免登录注入、`/events` 的 `afterSeq` 游标、五项环境体检、一次性配对码 `/pair/claim`、固定公网地址（Tailscale Funnel）自动选路。
+- 0.2.2 修补：一次性码兑换改为「先局域网、失败再隧道」的候选循环（4G 下不再白等局域网超时）；回合结束通知改读 `sessionTitle`/`answerHead`（之前读错字段导致通知只有标题、正文为空）；Android 12+ 不再从前台服务的网络回调里启动服务（避免 `ForegroundServiceStartNotAllowedException` 崩溃）；页面切换时销毁旧 WebView（修内存泄漏）。
 
 ## 说明
 
