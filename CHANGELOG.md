@@ -19,6 +19,8 @@
 - 鸿蒙：一次性码兑换改为同时打局域网与隧道（谁先回用谁），避免在移动数据上空等局域网超时把 60 秒耗光。
 - 安卓：同上，一次性码兑换改为先局域网、失败再走隧道的候选循环。
 - 桌面面板：二维码每 40 秒自动换新，并标注「一次性码 60 秒过期」。
+- **固定地址下页面白屏**（鸿蒙真机定位到）：Tailscale Funnel 下 DSH 前端的主连接是 `wss://<域名>/api/remote.mux`，如果 WebSocket 升级请求没带 cookie，DSH 回 401，Chromium 报 `ERR_WS_UPGRADE (-173)`，页面就整片空白（HTTP 资源其实都下下来了）。桥现在在 `upgrade` 事件里兜底：请求没带 cookie 时用 `browserAuth.authenticatedUrl()` + `fetchAuthCookie()` 自己换一个 `dsh-auth-*` 注入到上游请求头，日志打印 `WS 升级 … cookie=injected` 与 `WS 上游响应 HTTP/1.1 101`。
+- 桥的 WS 反代会记录升级结果（`WS 升级 <host><url> cookie=client|injected|none` + 上游响应首行），以后白屏能直接从日志区分是 401/403/409 还是链路问题。
 - `bridge/cordis.patch.yml` 之前被工具写成了乱码（`dshremote-bridge锛欴SH…`），整篇重写为正常 UTF-8 并补全注释。
 
 
